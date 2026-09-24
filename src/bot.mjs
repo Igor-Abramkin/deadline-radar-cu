@@ -13,13 +13,22 @@ const LIST_DAYS = Number(process.env.LIST_DAYS || 14);
 const EXCLUDE = process.env.EXCLUDE_COURSES ? new RegExp(process.env.EXCLUDE_COURSES, "i") : null;
 
 const bot = new Bot(BOT_TOKEN);
-const send = (chatId, text) =>
-  bot.api.sendMessage(chatId, text, {
-    parse_mode: "HTML",
-    link_preview_options: { is_disabled: true },
-    // Forum groups: post into the deadlines topic, not General.
-    message_thread_id: chatId === CHAT_ID && THREAD_ID ? Number(THREAD_ID) : undefined,
+
+// In the forum group every outgoing message goes to the deadlines topic, even
+// a reply to a command typed in another topic: ctx.reply would otherwise answer
+// in whatever topic the command came from.
+if (CHAT_ID && THREAD_ID) {
+  bot.api.config.use((prev, method, payload, signal) => {
+    if (method.startsWith("send") && String(payload?.chat_id) === CHAT_ID) {
+      payload = { ...payload, message_thread_id: Number(THREAD_ID) };
+      delete payload.reply_parameters;
+    }
+    return prev(method, payload, signal);
   });
+}
+
+const send = (chatId, text) =>
+  bot.api.sendMessage(chatId, text, { parse_mode: "HTML", link_preview_options: { is_disabled: true } });
 
 async function fetchTasks() {
   const tasks = await getUpcomingTasks();
