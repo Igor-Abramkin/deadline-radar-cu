@@ -9,9 +9,13 @@ const dateFmt = new Intl.DateTimeFormat("ru-RU", {
   minute: "2-digit",
 });
 
+const timeFmt = new Intl.DateTimeFormat("ru-RU", { timeZone: TZ, hour: "2-digit", minute: "2-digit" });
+
 export const escape = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
 export const formatDate = (iso) => dateFmt.format(new Date(iso));
+
+export const formatTime = (ms) => timeFmt.format(new Date(ms));
 
 export function formatLeft(iso, now = Date.now()) {
   const hours = (Date.parse(iso) - now) / 3_600_000;

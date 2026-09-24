@@ -1,10 +1,12 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { Bot } from "grammy";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { Bot, InputFile } from "grammy";
 import { SessionExpiredError, getMe, getUpcomingTasks, setCookie } from "./lib/lms.mjs";
 import { loadState, saveState } from "./lib/store.mjs";
 import { diff } from "./lib/diff.mjs";
 import { guardCommand } from "./lib/guard.mjs";
-import { escape, formatDate, formatList, formatTask } from "./lib/format.mjs";
+import { escape, formatDate, formatList, formatTask, formatTime } from "./lib/format.mjs";
+import { contestEvent, formatReminder, formatResult, winners } from "./lib/contest.mjs";
+import { screenshot } from "./lib/screenshot.mjs";
 
 const { BOT_TOKEN, CHAT_ID, OWNER_ID, THREAD_ID } = process.env;
 if (!BOT_TOKEN) throw new Error("BOT_TOKEN is not set in .env");
@@ -15,6 +17,9 @@ const LIST_DAYS = Number(process.env.LIST_DAYS || 14);
 const GROUP_COOLDOWN_SEC = Number(process.env.GROUP_COOLDOWN_SEC || 3600);
 const PRIVATE_COOLDOWN_SEC = Number(process.env.PRIVATE_COOLDOWN_SEC || 30);
 const EXCLUDE = process.env.EXCLUDE_COURSES ? new RegExp(process.env.EXCLUDE_COURSES, "i") : null;
+const DATA_DIR = process.env.DATA_DIR || "data";
+const CONTEST_URL = process.env.CONTEST_URL;
+const CONTEST_REMIND_HOURS = (process.env.CONTEST_REMIND_HOURS || "72,48,24,12,3,1").split(",").map(Number);
 
 const bot = new Bot(BOT_TOKEN);
 
@@ -39,11 +44,13 @@ async function fetchTasks() {
   return EXCLUDE ? tasks.filter((t) => !EXCLUDE.test(t.course)) : tasks;
 }
 
-function renderList(tasks, now) {
+// The group summary is edited on every poll, so it says when it was last true.
+function renderList(tasks, now, live = false) {
   const soon = tasks.filter((t) => Date.parse(t.deadline) <= now + LIST_DAYS * 86_400_000);
-  return soon.length
+  const text = soon.length
     ? `<b>Дедлайны на ${LIST_DAYS} дней</b>\n\n${formatList(soon, now)}`
     : `На ближайшие ${LIST_DAYS} дней дедлайнов нет 🎉`;
+  return live ? `${text}\n\n<i>Обновлено в ${formatTime(now)}</i>` : text;
 }
 
 
@@ -88,19 +95,41 @@ async function tick() {
 
   for (const text of messages) await send(CHAT_ID, text);
   saveState(state);
+  await refreshSummary(tasks, now);
   console.log(new Date().toISOString(), `tasks=${tasks.length} posted=${messages.length}`);
 }
 
 // The latest group summary stays pinned; the previous one is unpinned so the
 // topic shows a single current list.
-const PINNED_FILE = `${process.env.DATA_DIR || "data"}/pinned.json`;
+const PINNED_FILE = `${DATA_DIR}/pinned.json`;
+const pinnedId = () => (existsSync(PINNED_FILE) ? JSON.parse(readFileSync(PINNED_FILE, "utf8")).messageId : null);
+
 async function pinSummary(messageId) {
-  const previous = existsSync(PINNED_FILE) ? JSON.parse(readFileSync(PINNED_FILE, "utf8")).messageId : null;
+  const previous = pinnedId();
   await bot.api.pinChatMessage(CHAT_ID, messageId, { disable_notification: true });
   writeFileSync(PINNED_FILE, JSON.stringify({ messageId }));
   if (previous && previous !== messageId) {
     await bot.api.unpinChatMessage(CHAT_ID, previous).catch((err) => console.error("unpin failed:", err.description));
   }
+}
+
+// Between /deadlines calls the pinned summary is rewritten in place after each
+// poll: fresh "time left", new tasks in, passed ones out.
+async function refreshSummary(tasks, now) {
+  const messageId = pinnedId();
+  if (!messageId) return;
+  await bot.api
+    .editMessageText(CHAT_ID, messageId, renderList(tasks, now, true), {
+      parse_mode: "HTML",
+      link_preview_options: { is_disabled: true },
+    })
+    .catch((err) => {
+      const reason = err.description ?? err.message;
+      if (/not modified/.test(reason)) return;
+      console.error("summary edit failed:", reason);
+      // Someone deleted the summary: stop editing until the next /deadlines.
+      if (/not found|can't be edited/.test(reason)) rmSync(PINNED_FILE, { force: true });
+    });
 }
 
 // Drop the "bot pinned a message" service line the pin leaves in the topic.
@@ -151,9 +180,10 @@ bot.command(["start", "help"], (ctx) =>
 
 bot.command("deadlines", async (ctx) => {
   try {
-    const text = renderList(await fetchTasks(), Date.now());
+    const inGroup = String(ctx.chat.id) === CHAT_ID;
+    const text = renderList(await fetchTasks(), Date.now(), inGroup);
     const msg = await ctx.reply(text, { parse_mode: "HTML", link_preview_options: { is_disabled: true } });
-    if (String(ctx.chat.id) === CHAT_ID) await pinSummary(msg.message_id);
+    if (inGroup) await pinSummary(msg.message_id);
   } catch (err) {
     console.error(err);
     await ctx.reply("Не получилось достучаться до LMS, попробуй позже.");
@@ -184,6 +214,74 @@ bot.command("session", async (ctx) => {
 
 bot.catch((err) => console.error(err));
 
+// Optional contest countdown (CONTEST_URL, see README), posted with a screenshot
+// of the contest page. Checked every minute so
+// the "1 hour left" post isn't up to a whole LMS poll late; the contest JSON
+// itself is refetched once per poll and right before posting.
+const CONTEST_FILE = `${DATA_DIR}/contest.json`;
+let contest = null;
+let contestFetchedAt = 0;
+
+async function fetchContest() {
+  const res = await fetch(CONTEST_URL, { signal: AbortSignal.timeout(15_000) });
+  if (!res.ok) throw new Error(`contest ${CONTEST_URL} → ${res.status}`);
+  contest = await res.json();
+  contestFetchedAt = Date.now();
+  return contest;
+}
+
+// Tries each photo source in turn; the post goes out as text if none works.
+async function sendWithPhoto(text, ...photos) {
+  for (const photo of photos) {
+    try {
+      const file = await photo();
+      if (file) return await bot.api.sendPhoto(CHAT_ID, file, { caption: text, parse_mode: "HTML" });
+    } catch (err) {
+      console.error("contest photo failed:", err.description ?? err.message);
+    }
+  }
+  await send(CHAT_ID, text);
+}
+
+const pageShot = (contest) => async () => {
+  const jpeg = await screenshot(contest.url);
+  return jpeg && new InputFile(jpeg, "contest.jpg");
+};
+
+// The result shows the winning card's own image (the future group avatar);
+// a tie or a card without one falls back to a screenshot of the page.
+function postResult(contest) {
+  const [winner, ...tie] = winners(contest.entries);
+  // Uploaded, not passed by URL: Telegram rejects some formats (webp) by link.
+  const winnerImage = async () => winner?.imageUrl && !tie.length && new InputFile(new URL(winner.imageUrl));
+  return sendWithPhoto(formatResult(contest), winnerImage, pageShot(contest));
+}
+
+async function contestTick() {
+  const now = Date.now();
+  if (now - contestFetchedAt >= POLL_MINUTES * 60_000) await fetchContest();
+  const state = existsSync(CONTEST_FILE) ? JSON.parse(readFileSync(CONTEST_FILE, "utf8")) : {};
+  const event = contestEvent(state, contest, now, CONTEST_REMIND_HOURS);
+  if (event) {
+    // Post the current standings, not the ones cached up to a poll ago. A
+    // failed post leaves the state unsaved, so it's retried next minute.
+    await fetchContest();
+    if (event.type === "reminder") await sendWithPhoto(formatReminder(contest, event.hours), pageShot(contest));
+    else await postResult(contest);
+    console.log(new Date().toISOString(), `contest ${event.type}`, event.hours ?? "");
+  }
+  writeFileSync(CONTEST_FILE, JSON.stringify(state));
+}
+
+async function contestLoop() {
+  try {
+    await contestTick();
+  } catch (err) {
+    console.error(new Date().toISOString(), "contest:", err.message);
+  }
+  setTimeout(contestLoop, 60_000);
+}
+
 async function loop() {
   try {
     await tick();
@@ -199,4 +297,5 @@ await bot.api.setMyCommands([
 ]);
 if (!CHAT_ID) console.warn("CHAT_ID is not set: add the bot to the group, send /chatid, put the id in .env");
 loop();
+if (CONTEST_URL && CHAT_ID) contestLoop();
 bot.start({ onStart: (me) => console.log(`@${me.username} started`) });
