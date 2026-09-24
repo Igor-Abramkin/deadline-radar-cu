@@ -6,7 +6,8 @@ const OWN_COMMANDS = new Set(["start", "help", "deadlines", "chatid", "session"]
 // In the group every command message is removed (the deadlines topic is closed,
 // so people type commands elsewhere and the answer goes to the topic), repeats
 // within the cooldown are ignored, and /session never runs there because it
-// carries the LMS cookie.
+// carries the LMS cookie. The owner has no cooldown and doesn't use up anyone
+// else's; /chatid and /session are owner-only.
 export function guardCommand(msg, lastRun, cfg) {
   const m = msg.text?.match(/^\/([a-z_]+)(?:@(\w+))?(?:\s|$)/i);
   if (!m) return null;
@@ -16,7 +17,10 @@ export function guardCommand(msg, lastRun, cfg) {
 
   const inGroup = String(msg.chatId) === cfg.chatId;
   if (!inGroup && msg.chatType !== "private") return { command, remove: false, run: true };
-  if (command === "session") return { command, remove: inGroup, run: !inGroup };
+  const isOwner = String(msg.userId) === cfg.ownerId;
+  if (command === "session") return { command, remove: inGroup, run: !inGroup && isOwner };
+  if (command === "chatid" && !isOwner) return { command, remove: inGroup, run: false };
+  if (isOwner) return { command, remove: inGroup, run: true };
 
   const key = inGroup ? `group:${command}` : `user:${msg.userId}:${command}`;
   const cooldown = inGroup ? cfg.groupCooldownMs : cfg.privateCooldownMs;

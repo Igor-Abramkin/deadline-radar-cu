@@ -1,3 +1,4 @@
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { Bot } from "grammy";
 import { SessionExpiredError, getMe, getUpcomingTasks, setCookie } from "./lib/lms.mjs";
 import { loadState, saveState } from "./lib/store.mjs";
@@ -90,6 +91,24 @@ async function tick() {
   console.log(new Date().toISOString(), `tasks=${tasks.length} posted=${messages.length}`);
 }
 
+// The latest group summary stays pinned; the previous one is unpinned so the
+// topic shows a single current list.
+const PINNED_FILE = `${process.env.DATA_DIR || "data"}/pinned.json`;
+async function pinSummary(messageId) {
+  const previous = existsSync(PINNED_FILE) ? JSON.parse(readFileSync(PINNED_FILE, "utf8")).messageId : null;
+  await bot.api.pinChatMessage(CHAT_ID, messageId, { disable_notification: true });
+  writeFileSync(PINNED_FILE, JSON.stringify({ messageId }));
+  if (previous && previous !== messageId) {
+    await bot.api.unpinChatMessage(CHAT_ID, previous).catch((err) => console.error("unpin failed:", err.description));
+  }
+}
+
+// Drop the "bot pinned a message" service line the pin leaves in the topic.
+bot.on("message:pinned_message", async (ctx, next) => {
+  if (String(ctx.chat.id) !== CHAT_ID || ctx.from?.id !== ctx.me.id) return next();
+  await ctx.deleteMessage().catch((err) => console.error("delete pin notice failed:", err.description));
+});
+
 const lastRun = new Map();
 bot.on("message:text", async (ctx, next) => {
   const verdict = guardCommand(
@@ -108,6 +127,7 @@ bot.on("message:text", async (ctx, next) => {
       botUsername: ctx.me.username,
       groupCooldownMs: GROUP_COOLDOWN_SEC * 1000,
       privateCooldownMs: PRIVATE_COOLDOWN_SEC * 1000,
+      ownerId: OWNER_ID,
     },
   );
   if (!verdict) return next();
@@ -132,7 +152,8 @@ bot.command(["start", "help"], (ctx) =>
 bot.command("deadlines", async (ctx) => {
   try {
     const text = renderList(await fetchTasks(), Date.now());
-    await ctx.reply(text, { parse_mode: "HTML", link_preview_options: { is_disabled: true } });
+    const msg = await ctx.reply(text, { parse_mode: "HTML", link_preview_options: { is_disabled: true } });
+    if (String(ctx.chat.id) === CHAT_ID) await pinSummary(msg.message_id);
   } catch (err) {
     console.error(err);
     await ctx.reply("Не получилось достучаться до LMS, попробуй позже.");
