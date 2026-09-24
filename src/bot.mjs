@@ -2,6 +2,7 @@ import { Bot } from "grammy";
 import { SessionExpiredError, getMe, getUpcomingTasks, setCookie } from "./lib/lms.mjs";
 import { loadState, saveState } from "./lib/store.mjs";
 import { diff } from "./lib/diff.mjs";
+import { guardCommand } from "./lib/guard.mjs";
 import { escape, formatDate, formatList, formatTask } from "./lib/format.mjs";
 
 const { BOT_TOKEN, CHAT_ID, OWNER_ID, THREAD_ID } = process.env;
@@ -10,6 +11,8 @@ if (!BOT_TOKEN) throw new Error("BOT_TOKEN is not set in .env");
 const REMIND_HOURS = (process.env.REMIND_HOURS || "72,24,3").split(",").map(Number);
 const POLL_MINUTES = Number(process.env.POLL_MINUTES || 30);
 const LIST_DAYS = Number(process.env.LIST_DAYS || 14);
+const GROUP_COOLDOWN_SEC = Number(process.env.GROUP_COOLDOWN_SEC || 300);
+const PRIVATE_COOLDOWN_SEC = Number(process.env.PRIVATE_COOLDOWN_SEC || 30);
 const EXCLUDE = process.env.EXCLUDE_COURSES ? new RegExp(process.env.EXCLUDE_COURSES, "i") : null;
 
 const bot = new Bot(BOT_TOKEN);
@@ -78,6 +81,31 @@ async function tick() {
   saveState(state);
   console.log(new Date().toISOString(), `tasks=${tasks.length} posted=${messages.length}`);
 }
+
+const lastRun = new Map();
+bot.on("message:text", async (ctx, next) => {
+  const verdict = guardCommand(
+    {
+      text: ctx.msg.text,
+      chatId: ctx.chat.id,
+      chatType: ctx.chat.type,
+      threadId: ctx.msg.message_thread_id,
+      userId: ctx.from.id,
+      now: Date.now(),
+    },
+    lastRun,
+    {
+      chatId: CHAT_ID,
+      threadId: THREAD_ID,
+      botUsername: ctx.me.username,
+      groupCooldownMs: GROUP_COOLDOWN_SEC * 1000,
+      privateCooldownMs: PRIVATE_COOLDOWN_SEC * 1000,
+    },
+  );
+  if (!verdict) return next();
+  if (verdict.remove) await ctx.deleteMessage().catch((err) => console.error("delete failed:", err.description));
+  if (verdict.run) return next();
+});
 
 bot.command(["start", "help"], (ctx) =>
   ctx.reply(
