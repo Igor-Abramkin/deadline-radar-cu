@@ -1,10 +1,11 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 
 const BASE = "https://my.centraluniversity.ru/api/micro-lms";
 const DATA_DIR = process.env.DATA_DIR || "data";
 const COOKIE_FILE = `${DATA_DIR}/cookie.txt`;
 const SEED_FILE = `${DATA_DIR}/cookie-seed.txt`;
 const SESSION_FILE = `${DATA_DIR}/session.json`;
+mkdirSync(DATA_DIR, { recursive: true });
 
 export class SessionExpiredError extends Error {}
 
@@ -21,7 +22,8 @@ function loadCookie() {
     writeFileSync(COOKIE_FILE, seed, { mode: 0o600 });
     return seed;
   }
-  if (existsSync(COOKIE_FILE)) return readFileSync(COOKIE_FILE, "utf8").trim();
+  const saved = existsSync(COOKIE_FILE) && readFileSync(COOKIE_FILE, "utf8").trim();
+  if (saved) return saved;
   if (existsSync(SESSION_FILE)) {
     const { cookies } = JSON.parse(readFileSync(SESSION_FILE, "utf8"));
     const bff = cookies.find((c) => c.name === "bff.cookie");
@@ -37,14 +39,18 @@ export function setCookie(value) {
   writeFileSync(COOKIE_FILE, cookie, { mode: 0o600 });
 }
 
+// Called right after a browser login, so the fresh session wins over whatever
+// cookie.txt or CU_COOKIE still hold.
 export function saveCookieFromSession() {
-  if (existsSync(COOKIE_FILE)) writeFileSync(COOKIE_FILE, "");
-  cookie = loadCookie();
-  if (cookie) writeFileSync(COOKIE_FILE, cookie, { mode: 0o600 });
+  const { cookies } = JSON.parse(readFileSync(SESSION_FILE, "utf8"));
+  const bff = cookies.find((c) => c.name === "bff.cookie");
+  if (!bff) throw new Error("no bff.cookie in the browser session");
+  setCookie(bff.value);
+  return bff.value;
 }
 
 async function get(path, params = {}) {
-  if (!cookie) throw new SessionExpiredError("no session, run `pnpm login`");
+  if (!cookie) throw new SessionExpiredError("no session, run `bun run login`");
   const url = new URL(BASE + path);
   for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
   const res = await fetch(url, { headers: { cookie: `bff.cookie=${cookie}` } });
@@ -54,7 +60,7 @@ async function get(path, params = {}) {
     if (m && m[1] !== cookie) setCookie(m[1]);
   }
 
-  if (res.status === 401) throw new SessionExpiredError("LMS session expired, run `pnpm login`");
+  if (res.status === 401) throw new SessionExpiredError("LMS session expired, run `bun run login`");
   if (!res.ok) throw new Error(`LMS ${path} → ${res.status}: ${(await res.text()).slice(0, 200)}`);
   return res.json();
 }

@@ -1,8 +1,16 @@
 {
-  "name": "hx-deadline-radar",
+  "name": "deadline-radar-cu",
   "private": true,
+  "description": "Telegram-бот с дедлайнами из LMS Центрального университета",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Igor-Abramkin/deadline-radar-cu"
+  },
   "type": "module",
   "scripts": {
+    "setup": "bun src/cli/setup.mjs",
+    "deploy": "bun src/cli/deploy.mjs",
     "login": "bun src/login.mjs",
     "start": "bun src/bot.mjs",
     "test": "bun test"
@@ -11,6 +19,7 @@
     "grammy": "^1.46.0"
   },
   "devDependencies": {
+    "@clack/prompts": "^1.8.1",
     "playwright": "^1.63.0"
   }
 }

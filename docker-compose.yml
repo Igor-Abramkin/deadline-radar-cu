@@ -1,0 +1,10 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - deadline-radar-data:/app/data
+
+volumes:
+  deadline-radar-data:
