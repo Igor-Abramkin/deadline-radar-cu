@@ -1,0 +1,16 @@
+{
+  "name": "hx-deadline-radar",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "login": "bun src/login.mjs",
+    "start": "bun src/bot.mjs",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "grammy": "^1.46.0"
+  },
+  "devDependencies": {
+    "playwright": "^1.63.0"
+  }
+}
