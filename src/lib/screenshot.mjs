@@ -7,7 +7,8 @@ export async function screenshot(url) {
   let browser;
   try {
     const { chromium } = await import("playwright");
-    browser = await chromium.launch();
+    // Docker gives /dev/shm only 64 MB, which Chromium can run out of.
+    browser = await chromium.launch({ args: ["--disable-dev-shm-usage"] });
     const page = await browser.newPage({
       viewport: { width: 1280, height: 900 },
       deviceScaleFactor: 2,
