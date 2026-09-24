@@ -120,6 +120,7 @@ bot.on("message:text", async (ctx, next) => {
     },
   );
   if (!verdict) return next();
+  console.log(new Date().toISOString(), `/${verdict.command} from ${ctx.from.id} in ${ctx.chat.id}#${ctx.msg.message_thread_id ?? "-"}`, verdict);
   if (verdict.remove) await ctx.deleteMessage().catch((err) => console.error("delete failed:", err.description));
   if (verdict.run) return next();
 });
@@ -171,6 +172,7 @@ bot.command("session", async (ctx) => {
 });
 
 bot.callbackQuery(REFRESH_DATA, async (ctx) => {
+  console.log(new Date().toISOString(), `refresh pressed by ${ctx.from.id}`);
   if (!summary) return ctx.answerCallbackQuery();
   if (Date.now() - summaryUpdatedAt < REFRESH_COOLDOWN_SEC * 1000) {
     return ctx.answerCallbackQuery({ text: "Сводка уже свежая 👌" });
