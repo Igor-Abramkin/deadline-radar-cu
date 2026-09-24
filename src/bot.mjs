@@ -4,7 +4,7 @@ import { loadState, saveState } from "./lib/store.mjs";
 import { diff } from "./lib/diff.mjs";
 import { escape, formatDate, formatList, formatTask } from "./lib/format.mjs";
 
-const { BOT_TOKEN, CHAT_ID, OWNER_ID } = process.env;
+const { BOT_TOKEN, CHAT_ID, OWNER_ID, THREAD_ID } = process.env;
 if (!BOT_TOKEN) throw new Error("BOT_TOKEN is not set in .env");
 
 const REMIND_HOURS = (process.env.REMIND_HOURS || "72,24,3").split(",").map(Number);
@@ -14,7 +14,12 @@ const EXCLUDE = process.env.EXCLUDE_COURSES ? new RegExp(process.env.EXCLUDE_COU
 
 const bot = new Bot(BOT_TOKEN);
 const send = (chatId, text) =>
-  bot.api.sendMessage(chatId, text, { parse_mode: "HTML", link_preview_options: { is_disabled: true } });
+  bot.api.sendMessage(chatId, text, {
+    parse_mode: "HTML",
+    link_preview_options: { is_disabled: true },
+    // Forum groups: post into the deadlines topic, not General.
+    message_thread_id: chatId === CHAT_ID && THREAD_ID ? Number(THREAD_ID) : undefined,
+  });
 
 async function fetchTasks() {
   const tasks = await getUpcomingTasks();
