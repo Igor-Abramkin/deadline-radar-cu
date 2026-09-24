@@ -3,6 +3,7 @@ import { SessionExpiredError, getMe, getUpcomingTasks, setCookie } from "./lib/l
 import { loadState, saveState } from "./lib/store.mjs";
 import { diff } from "./lib/diff.mjs";
 import { guardCommand } from "./lib/guard.mjs";
+import { REFRESH_DATA, createSummary } from "./lib/summary.mjs";
 import { escape, formatDate, formatList, formatTask } from "./lib/format.mjs";
 
 const { BOT_TOKEN, CHAT_ID, OWNER_ID, THREAD_ID } = process.env;
@@ -13,6 +14,7 @@ const POLL_MINUTES = Number(process.env.POLL_MINUTES || 30);
 const LIST_DAYS = Number(process.env.LIST_DAYS || 14);
 const GROUP_COOLDOWN_SEC = Number(process.env.GROUP_COOLDOWN_SEC || 300);
 const PRIVATE_COOLDOWN_SEC = Number(process.env.PRIVATE_COOLDOWN_SEC || 30);
+const REFRESH_COOLDOWN_SEC = Number(process.env.REFRESH_COOLDOWN_SEC || 60);
 const EXCLUDE = process.env.EXCLUDE_COURSES ? new RegExp(process.env.EXCLUDE_COURSES, "i") : null;
 
 const bot = new Bot(BOT_TOKEN);
@@ -36,6 +38,20 @@ const send = (chatId, text) =>
 async function fetchTasks() {
   const tasks = await getUpcomingTasks();
   return EXCLUDE ? tasks.filter((t) => !EXCLUDE.test(t.course)) : tasks;
+}
+
+function renderList(tasks, now) {
+  const soon = tasks.filter((t) => Date.parse(t.deadline) <= now + LIST_DAYS * 86_400_000);
+  return soon.length
+    ? `<b>📌 Дедлайны на ${LIST_DAYS} дней</b>\n\n${formatList(soon, now)}`
+    : `На ближайшие ${LIST_DAYS} дней дедлайнов нет 🎉`;
+}
+
+const summary = CHAT_ID ? createSummary(bot.api, CHAT_ID, renderList) : null;
+let summaryUpdatedAt = 0;
+async function updateSummary(tasks) {
+  summaryUpdatedAt = Date.now();
+  await summary.update(tasks, summaryUpdatedAt);
 }
 
 function reminderTitle(hours) {
@@ -79,6 +95,7 @@ async function tick() {
 
   for (const text of messages) await send(CHAT_ID, text);
   saveState(state);
+  await updateSummary(tasks).catch((err) => console.error("summary update failed:", err.description ?? err.message));
   console.log(new Date().toISOString(), `tasks=${tasks.length} posted=${messages.length}`);
 }
 
@@ -115,6 +132,7 @@ bot.command(["start", "help"], (ctx) =>
       `• за ${REMIND_HOURS.map((h) => (h >= 24 ? `${h / 24} дн` : `${h} ч`)).join(", ")} до дедлайна,`,
       "• если дедлайн перенесли.",
       "",
+      "Закреплённая сводка в теме обновляется сама, кнопка 🔄 обновит её сразу.",
       `/deadlines — дедлайны на ${LIST_DAYS} дней вперёд`,
     ].join("\n"),
   ),
@@ -122,12 +140,7 @@ bot.command(["start", "help"], (ctx) =>
 
 bot.command("deadlines", async (ctx) => {
   try {
-    const now = Date.now();
-    const until = now + LIST_DAYS * 86_400_000;
-    const tasks = (await fetchTasks()).filter((t) => Date.parse(t.deadline) <= until);
-    const text = tasks.length
-      ? `<b>Дедлайны на ${LIST_DAYS} дней</b>\n\n${formatList(tasks, now)}`
-      : `На ближайшие ${LIST_DAYS} дней дедлайнов нет 🎉`;
+    const text = renderList(await fetchTasks(), Date.now());
     await ctx.reply(text, { parse_mode: "HTML", link_preview_options: { is_disabled: true } });
   } catch (err) {
     console.error(err);
@@ -154,6 +167,20 @@ bot.command("session", async (ctx) => {
     await ctx.reply(`✅ Сессия обновлена: ${me.firstName} ${me.lastName}`);
   } catch (err) {
     await ctx.reply(`❌ Кука не подошла: ${err.message}`);
+  }
+});
+
+bot.callbackQuery(REFRESH_DATA, async (ctx) => {
+  if (!summary) return ctx.answerCallbackQuery();
+  if (Date.now() - summaryUpdatedAt < REFRESH_COOLDOWN_SEC * 1000) {
+    return ctx.answerCallbackQuery({ text: "Сводка уже свежая 👌" });
+  }
+  try {
+    await updateSummary(await fetchTasks());
+    await ctx.answerCallbackQuery({ text: "Обновлено ✅" });
+  } catch (err) {
+    console.error("refresh failed:", err.description ?? err.message);
+    await ctx.answerCallbackQuery({ text: "LMS не ответила, попробуй позже" });
   }
 });
 
