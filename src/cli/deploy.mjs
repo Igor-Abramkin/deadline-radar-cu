@@ -20,13 +20,20 @@ const ONE_INSTANCE = "Бот с одним токеном может работ�
 export function deployGuide(target, { repo, bot, publicUrl }) {
   const dir = "deadline-radar-cu";
   const host = publicUrl && new URL(publicUrl).host;
+  const dns = `DNS-запись A для ${host} должна указывать на сервер.`;
   // Outside a panel, something has to terminate HTTPS for the calendar domain.
+  // Caddy runs as a service and renews the certificate by itself.
   const proxy = host
     ? [
         "",
-        `Календарь дедлайнов: направь ${host} на сервер (DNS, запись A)`,
-        "и поставь перед ботом HTTPS-прокси на порт 3000, например Caddy:",
-        `  caddy reverse-proxy --from ${host} --to localhost:3000`,
+        `Календарь дедлайнов: ${dns}`,
+        "Поставь Caddy (caddyserver.com/docs/install) и впиши в /etc/caddy/Caddyfile:",
+        `  ${host} {`,
+        "    reverse_proxy localhost:3000",
+        "  }",
+        "Затем: systemctl reload caddy",
+        "Если на сервере уже есть nginx или другой прокси, направь домен",
+        "на localhost:3000 через него.",
       ]
     : [];
   const guides = {
@@ -35,7 +42,7 @@ export function deployGuide(target, { repo, bot, publicUrl }) {
       `   ${repo}`,
       "   (свой форк или «Public repository», ветка main).",
       host
-        ? `2. Способ сборки: Dockerfile. Домен: ${publicUrl}, порт 3000.\n   DNS-запись A для ${host} должна указывать на сервер.`
+        ? `2. Способ сборки: Dockerfile. Домен: ${publicUrl}, порт 3000.\n   ${dns}`
         : "2. Способ сборки: Dockerfile. Порт и домен не нужны: бот сам ходит в Telegram.",
       "3. Добавь постоянный том (Persistent Storage) с путём /app/data.",
       `   ${VOLUME_WHY}`,
@@ -52,13 +59,19 @@ export function deployGuide(target, { repo, bot, publicUrl }) {
       `  scp deploy.env user@server:~/${dir}/.env`,
       "",
       "На сервере:",
-      ...(host ? ["", "Раскомментируй ports в docker-compose.yml."] : []),
-      `  cd ${dir} && docker compose up -d --build`,
+      `  cd ${dir} && docker compose ${host ? "--profile calendar " : ""}up -d --build`,
       "  docker compose logs -f",
+      ...(host
+        ? [
+            "",
+            `Профиль calendar запускает Caddy: он отдаёт календарь на ${host}`,
+            "и сам получает HTTPS-сертификат. Порты 80 и 443 должны быть свободны.",
+            dns,
+          ]
+        : []),
       "",
       "Данные бота лежат в томе Docker. Обновление:",
-      "  git pull && docker compose up -d --build",
-      ...proxy,
+      `  git pull && docker compose ${host ? "--profile calendar " : ""}up -d --build`,
     ],
     docker: [
       "На сервере:",
@@ -70,7 +83,7 @@ export function deployGuide(target, { repo, bot, publicUrl }) {
       "",
       "На сервере:",
       "  docker run -d --name deadline-radar --restart unless-stopped \\",
-      `    --env-file deploy.env -v deadline-radar-data:/app/data ${host ? "-p 3000:3000 " : ""}deadline-radar`,
+      `    --env-file deploy.env -v deadline-radar-data:/app/data ${host ? "-p 127.0.0.1:3000:3000 " : ""}deadline-radar`,
       "  docker logs -f deadline-radar",
       ...proxy,
     ],
