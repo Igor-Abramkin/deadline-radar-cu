@@ -17,6 +17,7 @@
   },
   "dependencies": {
     "grammy": "^1.46.0",
+    "ical.js": "^2.2.1",
     "playwright": "^1.63.0"
   },
   "devDependencies": {

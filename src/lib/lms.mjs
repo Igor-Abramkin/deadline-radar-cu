@@ -68,12 +68,12 @@ async function get(path, params = {}) {
 export const getMe = () => get("/students/me");
 
 // /deadlines drops tasks the account owner already submitted, which is wrong
-// for a group feed, so read every task and keep the ones still ahead.
-export async function getUpcomingTasks() {
+// for a group feed, so read every task. Past deadlines stay in: the calendar
+// feed keeps them, the bot filters them out.
+export async function getTasks() {
   const tasks = await get("/tasks/student", { limit: 1000 });
-  const now = Date.now();
   return tasks
-    .filter((t) => t.deadline && Date.parse(t.deadline) > now && !t.course.isArchived)
+    .filter((t) => t.deadline && !t.course.isArchived)
     .map((t) => ({
       id: t.exercise.id,
       name: t.exercise.name.trim(),

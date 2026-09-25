@@ -3,6 +3,9 @@ services:
     build: .
     restart: unless-stopped
     env_file: .env
+    # Uncomment with PUBLIC_URL set to serve the deadlines calendar.
+    # ports:
+    #   - "3000:3000"
     volumes:
       - deadline-radar-data:/app/data
 

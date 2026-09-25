@@ -10,4 +10,6 @@ COPY src ./src
 ENV DATA_DIR=/app/data TZ=Europe/Moscow
 RUN mkdir -p /app/data
 VOLUME /app/data
+# Only listens when PUBLIC_URL is set (deadlines calendar feed).
+EXPOSE 3000
 CMD ["bun", "src/bot.mjs"]
