@@ -17,6 +17,8 @@ const { api, bot } = await setupBot();
 const student = await setupLms();
 const group = await setupGroup(api, bot);
 const options = await setupOptions();
+const schedule = await setupSchedule(api, group);
+const feed = await setupFeed();
 
 const values = {
   BOT_TOKEN: api.token,
@@ -24,22 +26,35 @@ const values = {
   THREAD_ID: group.threadId ?? "",
   OWNER_ID: group.ownerId,
   ...options,
+  ...schedule,
+  ...feed,
 };
 writeEnv(ENV_FILE, { ...current, ...values, CU_COOKIE: undefined });
 writeEnv(DEPLOY_ENV_FILE, { ...values, CU_COOKIE: readFileSync(`${DATA_DIR}/cookie.txt`, "utf8").trim() });
 p.log.success(`Записал ${ENV_FILE} (для запуска на этом компьютере) и ${DEPLOY_ENV_FILE} (для сервера).`);
 p.log.warn(
-  `В ${DEPLOY_ENV_FILE} лежит сессия LMS (${student}): с ней можно зайти в твой аккаунт. Не коммить файл и никому его не отправляй.`,
+  [
+    `В ${DEPLOY_ENV_FILE} лежит сессия LMS (${student}): с ней можно зайти в твой аккаунт.`,
+    schedule.SCHEDULE_ICS_URL && "Там же ссылка на твой календарь: по ней видно все его события.",
+    "Не коммить файл и никому его не отправляй.",
+  ]
+    .filter(Boolean)
+    .join(" "),
 );
 
-p.log.step("Шаг 4 из 4 · запуск");
-if (!(await showDeployGuide({ repo: repoUrl(), bot: bot.username }))) stop();
+p.log.step("Шаг 5 из 5 · запуск");
+if (!(await showDeployGuide({ repo: repoUrl(), bot: bot.username, publicUrl: feed.PUBLIC_URL }))) stop();
 
 p.outro(
   [
     "После запуска бот молча запомнит текущие задания и дальше будет писать только о новых и о дедлайнах.",
+    schedule.SCHEDULE_ICS_URL &&
+      `В тему расписания бот сразу пришлёт пары на сегодня (если уже больше ${schedule.SCHEDULE_TIME}), дальше — каждый день.`,
+    feed.PUBLIC_URL && `Страница с подпиской на календарь: ${feed.PUBLIC_URL}`,
     `Проверить: отправь /deadlines в группе. Если сессия LMS истечёт, бот напишет тебе в личку.`,
-  ].join("\n   "),
+  ]
+    .filter(Boolean)
+    .join("\n   "),
 );
 
 // --- steps -------------------------------------------------------------------
@@ -51,7 +66,7 @@ async function setupBot() {
       "2. Придумай имя и username (он должен заканчиваться на bot).",
       "3. BotFather пришлёт токен вида 1234567890:AAE…",
     ].join("\n"),
-    "Шаг 1 из 4 · бот в Telegram",
+    "Шаг 1 из 5 · бот в Telegram",
   );
   for (;;) {
     const token = await ask(
@@ -94,7 +109,7 @@ async function setupLms() {
       "Бот видит LMS глазами этого аккаунта: в группу попадут задания",
       "только тех курсов, на которые ты записан.",
     ].join("\n"),
-    "Шаг 2 из 4 · вход в LMS",
+    "Шаг 2 из 5 · вход в LMS",
   );
   await gate("Открыть браузер?");
 
@@ -139,7 +154,7 @@ async function setupGroup(api, bot) {
       "3. Напиши любое сообщение туда, куда бот будет присылать дедлайны:",
       "   в нужную тему или просто в группу, если тем нет.",
     ].join("\n"),
-    "Шаг 3 из 4 · группа",
+    "Шаг 3 из 5 · группа",
   );
 
   for (;;) {
@@ -275,6 +290,164 @@ async function setupOptions() {
     }),
   );
   return { REMIND_HOURS: REMIND_HOURS.replace(/\s/g, ""), LIST_DAYS: LIST_DAYS.trim(), EXCLUDE_COURSES: EXCLUDE_COURSES ?? "" };
+}
+
+async function setupSchedule(api, group) {
+  p.log.step("Шаг 4 из 5 · расписание и календарь");
+  const off = { SCHEDULE_ICS_URL: "", SCHEDULE_THREAD_ID: "" };
+  const want = await ask(
+    p.confirm({
+      message: "Вести в группе отдельную тему с расписанием? Бот каждое утро пишет пары на сегодня и сообщает о переносах.",
+      initialValue: Boolean(current.SCHEDULE_ICS_URL),
+    }),
+  );
+  if (!want) return off;
+
+  p.note(
+    [
+      "Нужна ссылка на экспорт календаря с расписанием в формате iCal.",
+      "Яндекс Календарь: наведи на календарь «Расписание ЦУ» в списке слева,",
+      "нажми ⚙ → вкладка «Экспорт» → скопируй ссылку для iCal.",
+      "Она выглядит как https://calendar.yandex.ru/export/ics.xml?private_token=…",
+      "",
+      "Бот возьмёт только события от организатора",
+      `${process.env.SCHEDULE_ORGANIZER || "timetable@centraluniversity.ru"}: личные в группу не попадут.`,
+    ].join("\n"),
+    "Расписание",
+  );
+  const { localTime, parseSchedule } = await import("../lib/schedule.mjs");
+  let url;
+  for (;;) {
+    url = (
+      await ask(
+        p.text({
+          message: "Ссылка на календарь (iCal)",
+          initialValue: current.SCHEDULE_ICS_URL,
+          validate: (v) => (/^(https?|webcal):\/\/\S+$/.test(v?.trim() ?? "") ? undefined : "Нужна ссылка вида https://…"),
+        }),
+      )
+    )
+      .trim()
+      .replace(/^webcal:/, "https:");
+    const s = p.spinner();
+    s.start("Читаю календарь");
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(30_000) });
+      if (!res.ok) throw new Error(`календарь ответил ${res.status}`);
+      const now = Date.now();
+      const week = parseSchedule(await res.text(), {
+        from: now,
+        to: now + 7 * 86_400_000,
+        organizer: process.env.SCHEDULE_ORGANIZER ?? "timetable@centraluniversity.ru",
+      });
+      if (!week.length) {
+        s.error("На ближайшую неделю пар нет");
+        p.log.warn("Возможно, это не тот календарь, или неделя пустая.");
+        if (await ask(p.confirm({ message: "Взять эту ссылку всё равно?", initialValue: false }))) break;
+        continue;
+      }
+      s.stop(`Пар на ближайшую неделю: ${week.length}`);
+      const date = new Intl.DateTimeFormat("ru-RU", { weekday: "short", day: "numeric", month: "short" });
+      const preview = week
+        .slice(0, 5)
+        .map((c) => `${date.format(new Date(c.start))} ${localTime(c.start)}  ${c.title}${c.place ? ` · ${c.place}` : ""}`);
+      p.note(preview.join("\n") + (week.length > 5 ? "\n…" : ""), "Ближайшие пары");
+      if (await ask(p.confirm({ message: "Это твоё расписание?" }))) break;
+    } catch (err) {
+      s.error("Не получилось прочитать календарь");
+      p.log.error(err.message);
+    }
+  }
+
+  const threadId = await pickScheduleTopic(api, group);
+  if (!threadId) return off;
+
+  const SCHEDULE_TIME = await ask(
+    p.text({
+      message: "Во сколько присылать пары на сегодня",
+      initialValue: current.SCHEDULE_TIME || "09:00",
+      validate: (v) => (/^([01]\d|2[0-3]):[0-5]\d$/.test(v?.trim() ?? "") ? undefined : "Время в формате ЧЧ:ММ, например 09:00"),
+    }),
+  );
+  return { SCHEDULE_ICS_URL: url, SCHEDULE_THREAD_ID: threadId, SCHEDULE_TIME: SCHEDULE_TIME.trim() };
+}
+
+// The schedule needs a topic of its own in the same group, found the same way
+// as the deadlines one: by a message written in it.
+async function pickScheduleTopic(api, group) {
+  let offset = await pendingOffset(api);
+  p.note(
+    [
+      "1. Создай в группе тему для расписания, например «Расписание».",
+      "   Можно закрыть её для участников: писать туда будет только бот.",
+      "2. Напиши в неё любое сообщение.",
+    ].join("\n"),
+    "Тема для расписания",
+  );
+  for (;;) {
+    const s = p.spinner();
+    s.start("Жду сообщение в теме расписания");
+    let found;
+    try {
+      ({ found, offset } = await waitForGroupMessage(api, offset, 5 * 60_000));
+    } catch (err) {
+      s.error("Не получилось читать сообщения бота");
+      p.log.error(describe(err));
+      await gate("Проверить снова?");
+      continue;
+    }
+    if (!found) {
+      s.error("Сообщение не пришло");
+      if (!(await ask(p.confirm({ message: "Подождать ещё? («Нет» — без темы расписания)" })))) return null;
+      continue;
+    }
+    if (found.chatId !== group.chatId || !found.threadId) {
+      s.error(found.chatId !== group.chatId ? `Это другая группа: «${found.title}»` : "Сообщение не в теме");
+      p.log.info("Напиши в тему расписания той же группы, куда приходят дедлайны.");
+      continue;
+    }
+    if (found.threadId === group.threadId) {
+      s.error("Это тема дедлайнов");
+      p.log.info("Для расписания нужна отдельная тема.");
+      continue;
+    }
+    s.stop(`Тема #${found.threadId}`);
+    await api
+      .sendMessage(found.chatId, "📚 Сюда будут приходить пары на сегодня и изменения в расписании.", {
+        message_thread_id: Number(found.threadId),
+      })
+      .then(() => p.log.success("Отправил в тему проверочное сообщение."))
+      .catch((err) => p.log.warn(`Не смог написать в тему: ${describe(err)}`));
+    return found.threadId;
+  }
+}
+
+async function setupFeed() {
+  const want = await ask(
+    p.confirm({
+      message: "Опубликовать календарь с дедлайнами, на который можно подписаться в Apple, Google или Яндекс Календаре?",
+      initialValue: Boolean(current.PUBLIC_URL),
+    }),
+  );
+  if (!want) return { PUBLIC_URL: "" };
+  p.note(
+    [
+      "Бот будет отдавать календарь по HTTPS с порта 3000. Нужен домен на сервере,",
+      "где работает бот, например cal.example.com. В Coolify, Dokploy и похожих",
+      "панелях его указывают в настройках приложения, остальное покажу на шаге запуска.",
+      "Календарь публичный: по ссылке видны названия заданий и курсов.",
+    ].join("\n"),
+    "Календарь дедлайнов",
+  );
+  const url = await ask(
+    p.text({
+      message: "Адрес, по которому бот будет доступен",
+      placeholder: "https://cal.example.com",
+      initialValue: current.PUBLIC_URL,
+      validate: (v) => (/^https?:\/\/[^\s/]+\/?$/.test(v?.trim() ?? "") ? undefined : "Нужен адрес вида https://cal.example.com"),
+    }),
+  );
+  return { PUBLIC_URL: url.trim().replace(/\/+$/, "") };
 }
 
 // --- helpers -----------------------------------------------------------------
