@@ -21,7 +21,10 @@ test("the feed parses back with the deadline, escaped text and alarms", () => {
   const event = new ICAL.Event(vevent);
   assert.equal(event.uid, "42@deadline-radar-cu");
   assert.equal(event.summary, `⏰ ${task.name} · ${task.course}`);
-  assert.equal(event.startDate.toJSDate().toISOString(), "2026-09-25T20:55:00.000Z");
+  assert.equal(event.startDate.toJSDate().toISOString(), "2026-09-25T20:25:00.000Z");
+  assert.equal(event.endDate.toJSDate().toISOString(), "2026-09-25T20:55:00.000Z");
   assert.equal(event.description, `${task.course}\n${task.activity}\n${task.url}`);
-  assert.equal(vevent.getAllSubcomponents("valarm").length, 2);
+  const alarms = vevent.getAllSubcomponents("valarm");
+  assert.equal(alarms.length, 2);
+  for (const alarm of alarms) assert.equal(alarm.getFirstProperty("trigger").getParameter("related"), "END");
 });

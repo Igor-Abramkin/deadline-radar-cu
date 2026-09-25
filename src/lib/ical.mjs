@@ -26,9 +26,12 @@ function fold(line) {
   return out.join(CRLF);
 }
 
-// A deadline is a moment, not a slot, so each event starts and ends at it,
-// the way Moodle exports due dates. Clients that honour alarms in subscribed
-// calendars (Apple, Outlook) remind a day and three hours ahead.
+// A deadline is a moment, but a zero-length event is invisible in most
+// calendar apps, so each one is a half-hour block ending at the deadline.
+// Alarms are relative to that end, so clients that honour them in subscribed
+// calendars (Apple, Outlook) remind a day and three hours before the deadline.
+const SLOT_MS = 30 * 60 * 1000;
+
 export function deadlinesCalendar(tasks, now = Date.now()) {
   const lines = [
     "BEGIN:VCALENDAR",
@@ -42,20 +45,20 @@ export function deadlinesCalendar(tasks, now = Date.now()) {
     "X-PUBLISHED-TTL:PT1H",
   ];
   for (const t of tasks) {
-    const at = utc(Date.parse(t.deadline));
+    const end = Date.parse(t.deadline);
     lines.push(
       "BEGIN:VEVENT",
       `UID:${t.id}@deadline-radar-cu`,
       `DTSTAMP:${utc(now)}`,
-      `DTSTART:${at}`,
-      `DTEND:${at}`,
+      `DTSTART:${utc(end - SLOT_MS)}`,
+      `DTEND:${utc(end)}`,
       `SUMMARY:${escapeText(`⏰ ${t.name} · ${t.course}`)}`,
       `DESCRIPTION:${escapeText([t.course, t.activity, t.url].filter(Boolean).join("\n"))}`,
       `URL:${t.url}`,
       "TRANSP:TRANSPARENT",
     );
     for (const trigger of ["-P1D", "-PT3H"]) {
-      lines.push("BEGIN:VALARM", "ACTION:DISPLAY", `DESCRIPTION:${escapeText(t.name)}`, `TRIGGER:${trigger}`, "END:VALARM");
+      lines.push("BEGIN:VALARM", "ACTION:DISPLAY", `DESCRIPTION:${escapeText(t.name)}`, `TRIGGER;RELATED=END:${trigger}`, "END:VALARM");
     }
     lines.push("END:VEVENT");
   }
