@@ -6,5 +6,20 @@ services:
     volumes:
       - deadline-radar-data:/app/data
 
+  # HTTPS for the deadlines calendar: `docker compose --profile calendar up -d`.
+  # Serves the domain from PUBLIC_URL in .env and gets its certificate itself;
+  # ports 80 and 443 must be free and the domain must point at this server.
+  caddy:
+    image: caddy:2-alpine
+    profiles: [calendar]
+    restart: unless-stopped
+    command: caddy reverse-proxy --from ${PUBLIC_URL:-} --to bot:3000
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - caddy-data:/data
+
 volumes:
   deadline-radar-data:
+  caddy-data:

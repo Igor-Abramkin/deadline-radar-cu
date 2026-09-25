@@ -1,6 +1,7 @@
 // Deploy steps printed at the end of `bun run setup`. Every target needs the
 // same three things: run the Dockerfile (or `bun src/bot.mjs`), pass the
-// variables from deploy.env, keep /app/data on a persistent volume.
+// variables from deploy.env, keep /app/data on a persistent volume. With
+// PUBLIC_URL set, the deadlines calendar also needs its domain routed to 3000.
 // `bun run deploy` shows them again without redoing the setup.
 import { existsSync, readFileSync } from "node:fs";
 import * as p from "@clack/prompts";
@@ -16,14 +17,33 @@ export const TARGETS = [
 const VOLUME_WHY = "Без него бот после перезапуска забудет, о чём уже писал,\n   и потеряет обновлённую сессию LMS.";
 const ONE_INSTANCE = "Бот с одним токеном может работать только в одном месте: локальную копию останови.";
 
-export function deployGuide(target, { repo, bot }) {
+export function deployGuide(target, { repo, bot, publicUrl }) {
   const dir = "deadline-radar-cu";
+  const host = publicUrl && new URL(publicUrl).host;
+  const dns = `DNS-запись A для ${host} должна указывать на сервер.`;
+  // Outside a panel, something has to terminate HTTPS for the calendar domain.
+  // Caddy runs as a service and renews the certificate by itself.
+  const proxy = host
+    ? [
+        "",
+        `Календарь дедлайнов: ${dns}`,
+        "Поставь Caddy (caddyserver.com/docs/install) и впиши в /etc/caddy/Caddyfile:",
+        `  ${host} {`,
+        "    reverse_proxy localhost:3000",
+        "  }",
+        "Затем: systemctl reload caddy",
+        "Если на сервере уже есть nginx или другой прокси, направь домен",
+        "на localhost:3000 через него.",
+      ]
+    : [];
   const guides = {
     panel: [
       "1. Создай приложение из Git-репозитория:",
       `   ${repo}`,
       "   (свой форк или «Public repository», ветка main).",
-      "2. Способ сборки: Dockerfile. Порт и домен не нужны: бот сам ходит в Telegram.",
+      host
+        ? `2. Способ сборки: Dockerfile. Домен: ${publicUrl}, порт 3000.\n   ${dns}`
+        : "2. Способ сборки: Dockerfile. Порт и домен не нужны: бот сам ходит в Telegram.",
       "3. Добавь постоянный том (Persistent Storage) с путём /app/data.",
       `   ${VOLUME_WHY}`,
       "4. Вставь содержимое deploy.env в переменные окружения",
@@ -39,11 +59,19 @@ export function deployGuide(target, { repo, bot }) {
       `  scp deploy.env user@server:~/${dir}/.env`,
       "",
       "На сервере:",
-      `  cd ${dir} && docker compose up -d --build`,
+      `  cd ${dir} && docker compose ${host ? "--profile calendar " : ""}up -d --build`,
       "  docker compose logs -f",
+      ...(host
+        ? [
+            "",
+            `Профиль calendar запускает Caddy: он отдаёт календарь на ${host}`,
+            "и сам получает HTTPS-сертификат. Порты 80 и 443 должны быть свободны.",
+            dns,
+          ]
+        : []),
       "",
       "Данные бота лежат в томе Docker. Обновление:",
-      "  git pull && docker compose up -d --build",
+      `  git pull && docker compose ${host ? "--profile calendar " : ""}up -d --build`,
     ],
     docker: [
       "На сервере:",
@@ -55,8 +83,9 @@ export function deployGuide(target, { repo, bot }) {
       "",
       "На сервере:",
       "  docker run -d --name deadline-radar --restart unless-stopped \\",
-      "    --env-file deploy.env -v deadline-radar-data:/app/data deadline-radar",
+      `    --env-file deploy.env -v deadline-radar-data:/app/data ${host ? "-p 127.0.0.1:3000:3000 " : ""}deadline-radar`,
       "  docker logs -f deadline-radar",
+      ...proxy,
     ],
     systemd: [
       "На сервере:",
@@ -81,6 +110,7 @@ export function deployGuide(target, { repo, bot }) {
       "И запусти:",
       "  systemctl enable --now deadline-radar",
       "  journalctl -u deadline-radar -f",
+      ...proxy,
     ],
     local: [
       "  bun start",
@@ -88,6 +118,7 @@ export function deployGuide(target, { repo, bot }) {
       "Бот работает, пока открыт терминал и компьютер не спит.",
       "Когда будешь готов перенести его на сервер, запусти",
       "bun run deploy: deploy.env уже готов.",
+      ...(host ? ["", `Календарь на этом компьютере доступен только локально: http://localhost:3000.`, `${publicUrl} заработает, когда бот переедет на сервер.`] : []),
     ],
   };
   const lines = guides[target];
@@ -117,9 +148,11 @@ if (import.meta.main) {
     console.error("Нет deploy.env: сначала запусти bun run setup");
     process.exit(1);
   }
-  const token = readFileSync("deploy.env", "utf8").match(/^BOT_TOKEN=(.+)$/m)?.[1];
+  const env = readFileSync("deploy.env", "utf8");
+  const token = env.match(/^BOT_TOKEN=(.+)$/m)?.[1];
+  const publicUrl = env.match(/^PUBLIC_URL=(.+)$/m)?.[1];
   const { Api } = await import("grammy");
   const bot = token ? await new Api(token).getMe().then((me) => me.username).catch(() => "your_bot") : "your_bot";
   p.intro(" Deadline Radar · запуск на сервере ");
-  if (await showDeployGuide({ repo: repoUrl(), bot })) p.outro("Готово. Проверить: отправь /deadlines в группе.");
+  if (await showDeployGuide({ repo: repoUrl(), bot, publicUrl })) p.outro("Готово. Проверить: отправь /deadlines в группе.");
 }
