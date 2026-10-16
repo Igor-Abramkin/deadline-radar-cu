@@ -155,9 +155,13 @@ function changeType({ before, after }) {
 const span = (c) => `${localTime(c.start)}–${localTime(c.end)}`;
 const when = (c) => `${shortDayFmt.format(new Date(c.start))}, ${span(c)}`;
 const heading = (c) => `<b>${escape(c.title)}</b>${c.kind ? ` · ${escape(c.kind)}` : ""}`;
+// Classes flagged `signup` (SCHEDULE_SIGNUP) are open only to those who
+// signed up for them, so the post says so instead of calling everyone in.
+const signupNote = (c) => (c?.signup ? "✍️ <i>Только для записавшихся</i>" : null);
 
 function classLine(c) {
   const details = [c.kind, c.place].filter(Boolean).map(escape);
+  if (c.signup) details.push("только для записавшихся");
   if (c.url) details.push(`<a href="${escape(c.url)}">Толк</a>`);
   return [`<b>${span(c)}</b> · ${escape(c.title)}`, details.join(" · ")].filter(Boolean).join("\n");
 }
@@ -174,17 +178,18 @@ function formatChange({ type, before, after }) {
   let lines;
   switch (type) {
     case "added":
-      lines = [`🆕 Новая пара: ${heading(after)}`, when(after), place(after)];
+      lines = [`🆕 Новая пара: ${heading(after)}`, signupNote(after), when(after), place(after)];
       break;
     case "removed":
-      lines = [`❌ Отменили: ${heading(before)}`, `<s>${when(before)}</s>`];
+      lines = [`❌ Отменили: ${heading(before)}`, signupNote(before), `<s>${when(before)}</s>`];
       break;
     case "moved":
-      lines = [`🔁 Перенесли: ${heading(after)}`, `было: ${when(before)}`, `стало: ${when(after)}`, placeMove()];
+      lines = [`🔁 Перенесли: ${heading(after)}`, signupNote(after), `было: ${when(before)}`, `стало: ${when(after)}`, placeMove()];
       break;
     default:
       lines = [
         before.place !== after.place ? `📍 Другая аудитория: ${heading(after)}` : `✏️ Изменили: ${heading(after)}`,
+        signupNote(after),
         when(after),
         placeMove(),
       ];

@@ -29,6 +29,8 @@ const SCHEDULE_TIME = process.env.SCHEDULE_TIME || "09:00";
 const SCHEDULE_DAYS = Number(process.env.SCHEDULE_DAYS || 7);
 const SCHEDULE_POLL_MINUTES = Number(process.env.SCHEDULE_POLL_MINUTES || 15);
 const SCHEDULE_ORGANIZER = process.env.SCHEDULE_ORGANIZER ?? "timetable@centraluniversity.ru";
+const SCHEDULE_EXCLUDE = process.env.SCHEDULE_EXCLUDE ? new RegExp(process.env.SCHEDULE_EXCLUDE, "i") : null;
+const SCHEDULE_SIGNUP = process.env.SCHEDULE_SIGNUP ? new RegExp(process.env.SCHEDULE_SIGNUP, "i") : null;
 
 const bot = new Bot(BOT_TOKEN);
 
@@ -324,6 +326,12 @@ const DAY_MS = 86_400_000;
 const SCHEDULE_HORIZON_MS = 60 * DAY_MS;
 let scheduleFetchedAt = 0;
 
+// SCHEDULE_EXCLUDE and SCHEDULE_SIGNUP only shape what gets posted. The
+// snapshot keeps every class, so editing either list never reads as classes
+// cancelled or added.
+const hidden = (c) => SCHEDULE_EXCLUDE?.test(c.title);
+const marked = (c) => (c && SCHEDULE_SIGNUP?.test(c.title) ? { ...c, signup: true } : c);
+
 async function fetchSchedule(now) {
   const res = await fetch(SCHEDULE_ICS_URL, { signal: AbortSignal.timeout(30_000) });
   if (!res.ok) throw new Error(`schedule calendar → ${res.status}`);
@@ -354,16 +362,19 @@ async function scheduleTick() {
   const classes = await fetchSchedule(now);
   // The first run only takes a snapshot. State is saved right after the post,
   // so a failure further down can't repeat it.
-  const changes = state.classes ? diffSchedule(state, classes, now, SCHEDULE_DAYS * DAY_MS) : [];
+  const changes = (state.classes ? diffSchedule(state, classes, now, SCHEDULE_DAYS * DAY_MS) : [])
+    .filter((c) => !hidden(c.after ?? c.before))
+    .map((c) => ({ ...c, before: marked(c.before), after: marked(c.after) }));
   if (changes.length) await sendSchedule(formatChanges(changes));
   state.classes = Object.fromEntries(classes.map((c) => [c.key, c]));
   state.until = now + SCHEDULE_HORIZON_MS;
   writeAtomic(SCHEDULE_FILE, JSON.stringify(state));
 
   // Today's post is pinned in the topic and follows changes during the day.
-  const text = formatDay(classes.filter((c) => dayKey(c.start) === today), now);
+  const todays = classes.filter((c) => dayKey(c.start) === today && !hidden(c)).map(marked);
+  const text = formatDay(todays, now);
   if (dailyDue) {
-    const quiet = !classes.some((c) => dayKey(c.start) === today);
+    const quiet = !todays.length;
     const msg = await sendSchedule(text, { disable_notification: quiet });
     const previous = state.daily?.messageId;
     state.daily = { date: today, messageId: msg.message_id, text };
