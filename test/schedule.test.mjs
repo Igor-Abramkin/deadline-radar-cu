@@ -145,3 +145,12 @@ test("the day post lists classes, or says there are none", () => {
   assert.match(text, /Лекция · S308 \(ЦТ\) · <a href="https:\/\/k.talk\/x">Толк<\/a>/);
   assert.match(formatDay([], day), /Пар нет/);
 });
+
+test("a sign-up-only class carries a note in changes and in the day post", () => {
+  const a = cls("g/1", "2026-09-26T13:00:00+03:00", { title: "Грейдап. Развитие внутри компании", kind: "Семинар", signup: true });
+  const text = formatChanges([{ type: "added", before: null, after: a }]);
+  assert.match(text, /Новая пара: <b>Грейдап\. Развитие внутри компании<\/b> · Семинар\n✍️ <i>Только для записавшихся<\/i>/);
+  const day = formatDay([a], Date.parse("2026-09-26T09:00:00+03:00"));
+  assert.match(day, /Семинар · S308 \(ЦТ\) · только для записавшихся/);
+  assert.doesNotMatch(formatDay([cls("s/1", "2026-09-26T16:00:00+03:00")], now), /записавшихся/);
+});
