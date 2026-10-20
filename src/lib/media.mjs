@@ -164,7 +164,7 @@ async function fetchTo(file, url, proxy) {
 // in mp4, which Telegram plays inline everywhere. Instagram photos and
 // carousels come from its metadata. Everything else (photo tweets, Reddit
 // galleries, TikTok slideshows) goes to gallery-dl.
-export async function downloadMedia(url, { ytdlp = "yt-dlp", gallerydl = "gallery-dl", cookies, proxy, timeoutMs = 5 * 60_000 } = {}) {
+export async function downloadMedia(url, { ytdlp = "yt-dlp", gallerydl = "gallery-dl", cookies, proxy, maxDurationSec = Infinity, timeoutMs = 5 * 60_000 } = {}) {
   const dir = mkdtempSync(path.join(tmpdir(), "media-"));
   const cleanup = () => rmSync(dir, { recursive: true, force: true });
   const common = [
@@ -180,6 +180,8 @@ export async function downloadMedia(url, { ytdlp = "yt-dlp", gallerydl = "galler
       .catch((err) => (console.error("yt-dlp probe:", err.message), null));
 
     if (probe?.is_live) throw new Error("live stream");
+    // A long video would hold up every link behind it.
+    if (probe?.duration > maxDurationSec) throw new Error(`video is ${Math.round(probe.duration / 60)} min long`);
     if (probe && probe._type !== "playlist" && probe.formats?.length) {
       // Reuse the probe instead of extracting the page a second time.
       const infoFile = path.join(dir, "info.json");

@@ -16,6 +16,7 @@
     "test": "bun test"
   },
   "dependencies": {
+    "@grammyjs/auto-retry": "^2.0.2",
     "grammy": "^1.46.0",
     "ical.js": "^2.2.1",
     "playwright": "^1.63.0"
