@@ -75,7 +75,7 @@ function run(cmd, args, timeoutMs) {
 // Downloads the video at `url` into a fresh temp dir with yt-dlp. Telegram
 // plays H.264 in mp4 inline on every client, so that's preferred, at up to
 // 720p to fit the upload limit. `cleanup` removes the dir.
-export async function downloadVideo(url, { ytdlp = "yt-dlp", cookies, timeoutMs = 5 * 60_000 } = {}) {
+export async function downloadVideo(url, { ytdlp = "yt-dlp", cookies, proxy, timeoutMs = 5 * 60_000 } = {}) {
   const dir = mkdtempSync(path.join(tmpdir(), "video-"));
   const cleanup = () => rmSync(dir, { recursive: true, force: true });
   try {
@@ -94,6 +94,7 @@ export async function downloadVideo(url, { ytdlp = "yt-dlp", cookies, timeoutMs 
       // YouTube needs a JS runtime; the bot already runs on one.
       "--js-runtimes", "bun",
       ...(cookies && existsSync(cookies) ? ["--cookies", cookies] : []),
+      ...(proxy ? ["--proxy", proxy] : []),
     ];
     const out = await run(ytdlp, args, timeoutMs);
     const line = out.trim().split("\n").at(-1);

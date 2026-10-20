@@ -175,6 +175,9 @@ bot.on("message:pinned_message", async (ctx, next) => {
 // the original. If the download fails, the message stays as it is.
 // Downloads run one at a time, so a burst of links can't fill the server.
 const COOKIES_FILE = `${DATA_DIR}/yt-dlp-cookies.txt`;
+// From a server in Russia most video sites are blocked; only yt-dlp goes
+// through this proxy, the rest of the bot doesn't.
+const VIDEO_PROXY = process.env.VIDEO_PROXY || undefined;
 let videoQueue = Promise.resolve();
 
 async function swapForVideo(ctx, link) {
@@ -185,7 +188,7 @@ async function swapForVideo(ctx, link) {
   const typing = setInterval(status, 4500);
   let video;
   try {
-    video = await downloadVideo(link.url, { cookies: COOKIES_FILE });
+    video = await downloadVideo(link.url, { cookies: COOKIES_FILE, proxy: VIDEO_PROXY });
     // Anonymous admins post as the group itself.
     const name = ctx.msg.sender_chat?.title ?? [ctx.from.first_name, ctx.from.last_name].filter(Boolean).join(" ");
     await bot.api.sendVideo(CHAT_ID, new InputFile(video.file), {
