@@ -10,7 +10,7 @@ import { screenshot } from "./lib/screenshot.mjs";
 import { deadlinesCalendar } from "./lib/ical.mjs";
 import { subscribePage } from "./lib/page.mjs";
 import { dayKey, diffSchedule, formatChanges, formatDay, localTime, parseSchedule } from "./lib/schedule.mjs";
-import { downloadVideo, findVideoLink, formatCaption, updateYtDlp } from "./lib/video.mjs";
+import { downloadMedia, findMediaLink, formatCaption, updateYtDlp } from "./lib/media.mjs";
 
 const { BOT_TOKEN, CHAT_ID, OWNER_ID, THREAD_ID, SCHEDULE_ICS_URL, SCHEDULE_THREAD_ID, VIDEO_THREAD_ID } = process.env;
 if (!BOT_TOKEN) throw new Error("BOT_TOKEN is not set in .env");
@@ -170,55 +170,70 @@ bot.on("message:pinned_message", async (ctx, next) => {
 });
 
 // Optional video topic (VIDEO_THREAD_ID, see README). A message there with a
-// link to a video site is swapped for the video itself: bots can't edit other
-// people's messages, so the bot reposts it with the author's name and deletes
-// the original. If the download fails, the message stays as it is.
+// link to a video or photo post is swapped for the media itself: bots can't
+// edit other people's messages, so the bot reposts it with the author's name
+// and deletes the original. If the download fails, the message stays as it is.
 // Downloads run one at a time, so a burst of links can't fill the server.
 const COOKIES_FILE = `${DATA_DIR}/yt-dlp-cookies.txt`;
-// From a server in Russia most video sites are blocked; only yt-dlp goes
-// through this proxy, the rest of the bot doesn't.
+// From a server in Russia most video sites are blocked; only the downloads
+// go through this proxy, the rest of the bot doesn't.
 const VIDEO_PROXY = process.env.VIDEO_PROXY || undefined;
 let videoQueue = Promise.resolve();
 
-async function swapForVideo(ctx, link) {
+function sendMedia(items, extra) {
+  const { caption, parse_mode, ...rest } = extra;
+  if (items.length === 1 && items[0].type === "photo") {
+    return bot.api.sendPhoto(CHAT_ID, new InputFile(items[0].file), extra);
+  }
+  if (items.length === 1) {
+    const { file, width, height, duration } = items[0];
+    return bot.api.sendVideo(CHAT_ID, new InputFile(file), { ...extra, width, height, duration, supports_streaming: true });
+  }
+  // An album carries one caption, on its first item.
+  const album = items.map(({ type, file, width, height, duration }, i) => ({
+    type,
+    media: new InputFile(file),
+    ...(i === 0 && { caption, parse_mode }),
+    ...(type === "video" && { width, height, duration, supports_streaming: true }),
+  }));
+  return bot.api.sendMediaGroup(CHAT_ID, album, rest);
+}
+
+async function swapForMedia(ctx, link) {
   const threadId = Number(VIDEO_THREAD_ID);
   // "sending a video…" in the topic header; Telegram drops it after 5 seconds.
   const status = () => bot.api.sendChatAction(CHAT_ID, "upload_video", { message_thread_id: threadId }).catch(() => {});
   status();
   const typing = setInterval(status, 4500);
-  let video;
+  let media;
   try {
-    video = await downloadVideo(link.url, { cookies: COOKIES_FILE, proxy: VIDEO_PROXY });
+    media = await downloadMedia(link.url, { cookies: COOKIES_FILE, proxy: VIDEO_PROXY });
     // Anonymous admins post as the group itself.
     const name = ctx.msg.sender_chat?.title ?? [ctx.from.first_name, ctx.from.last_name].filter(Boolean).join(" ");
-    await bot.api.sendVideo(CHAT_ID, new InputFile(video.file), {
+    await sendMedia(media.items, {
       message_thread_id: threadId,
       caption: formatCaption({ name, text: ctx.msg.text, link }),
       parse_mode: "HTML",
-      width: video.width,
-      height: video.height,
-      duration: video.duration,
-      supports_streaming: true,
       // Keeps a reply a reply after the original is gone.
       ...(ctx.msg.reply_to_message && !ctx.msg.reply_to_message.forum_topic_created && {
         reply_parameters: { message_id: ctx.msg.reply_to_message.message_id, allow_sending_without_reply: true },
       }),
     });
     await ctx.deleteMessage().catch((err) => console.error("delete link failed:", err.description));
-    console.log(new Date().toISOString(), `video from ${ctx.from.id}: ${link.url}`);
+    console.log(new Date().toISOString(), `media from ${ctx.from.id}: ${media.items.map((i) => i.type).join(",")} ${link.url}`);
   } catch (err) {
-    console.error(new Date().toISOString(), `video ${link.url}:`, err.description ?? err.message);
+    console.error(new Date().toISOString(), `media ${link.url}:`, err.description ?? err.message);
   } finally {
     clearInterval(typing);
-    video?.cleanup();
+    media?.cleanup();
   }
 }
 
 bot.on("message:text", (ctx, next) => {
   const inVideoTopic = VIDEO_THREAD_ID && String(ctx.chat.id) === CHAT_ID && ctx.msg.message_thread_id === Number(VIDEO_THREAD_ID);
-  const link = inVideoTopic && !ctx.msg.text.startsWith("/") && findVideoLink(ctx.msg.text, ctx.msg.entities);
+  const link = inVideoTopic && !ctx.msg.text.startsWith("/") && findMediaLink(ctx.msg.text, ctx.msg.entities);
   if (!link) return next();
-  videoQueue = videoQueue.then(() => swapForVideo(ctx, link));
+  videoQueue = videoQueue.then(() => swapForMedia(ctx, link));
 });
 
 const lastRun = new Map();
