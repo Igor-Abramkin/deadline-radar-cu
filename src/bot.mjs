@@ -1,5 +1,6 @@
 import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { Bot, InputFile } from "grammy";
+import { autoRetry } from "@grammyjs/auto-retry";
 import { SessionExpiredError, getMe, getTasks, setCookie } from "./lib/lms.mjs";
 import { loadState, saveState } from "./lib/store.mjs";
 import { diff } from "./lib/diff.mjs";
@@ -11,6 +12,7 @@ import { deadlinesCalendar } from "./lib/ical.mjs";
 import { subscribePage } from "./lib/page.mjs";
 import { dayKey, diffSchedule, formatChanges, formatDay, localTime, parseSchedule } from "./lib/schedule.mjs";
 import { downloadMedia, findMediaLink, formatCaption, updateYtDlp } from "./lib/media.mjs";
+import { queue } from "./lib/queue.mjs";
 
 const { BOT_TOKEN, CHAT_ID, OWNER_ID, THREAD_ID, SCHEDULE_ICS_URL, SCHEDULE_THREAD_ID, VIDEO_THREAD_ID } = process.env;
 if (!BOT_TOKEN) throw new Error("BOT_TOKEN is not set in .env");
@@ -34,6 +36,9 @@ const SCHEDULE_EXCLUDE = process.env.SCHEDULE_EXCLUDE ? new RegExp(process.env.S
 const SCHEDULE_SIGNUP = process.env.SCHEDULE_SIGNUP ? new RegExp(process.env.SCHEDULE_SIGNUP, "i") : null;
 
 const bot = new Bot(BOT_TOKEN);
+// On "Too Many Requests" (a burst of albums hits the group limit) Telegram
+// says how long to wait; the call is retried after that instead of failing.
+bot.api.config.use(autoRetry({ maxRetryAttempts: 5, maxDelaySeconds: 300 }));
 
 // In the forum group every outgoing message goes to the deadlines topic, even
 // a reply to a command typed in another topic: ctx.reply would otherwise answer
@@ -173,12 +178,14 @@ bot.on("message:pinned_message", async (ctx, next) => {
 // link to a video or photo post is swapped for the media itself: bots can't
 // edit other people's messages, so the bot reposts it with the author's name
 // and deletes the original. If the download fails, the message stays as it is.
-// Downloads run one at a time, so a burst of links can't fill the server.
+// Two downloads run at a time, so a burst of links can't fill the server, and
+// videos longer than VIDEO_MAX_MINUTES are skipped so they don't hold up the rest.
 const COOKIES_FILE = `${DATA_DIR}/yt-dlp-cookies.txt`;
 // From a server in Russia most video sites are blocked; only the downloads
 // go through this proxy, the rest of the bot doesn't.
 const VIDEO_PROXY = process.env.VIDEO_PROXY || undefined;
-let videoQueue = Promise.resolve();
+const VIDEO_MAX_MINUTES = Number(process.env.VIDEO_MAX_MINUTES || 5);
+const enqueue = queue(2);
 
 function sendMedia(items, extra) {
   const { caption, parse_mode, ...rest } = extra;
@@ -207,7 +214,7 @@ async function swapForMedia(ctx, link) {
   const typing = setInterval(status, 4500);
   let media;
   try {
-    media = await downloadMedia(link.url, { cookies: COOKIES_FILE, proxy: VIDEO_PROXY });
+    media = await downloadMedia(link.url, { cookies: COOKIES_FILE, proxy: VIDEO_PROXY, maxDurationSec: VIDEO_MAX_MINUTES * 60 });
     // Anonymous admins post as the group itself.
     const name = ctx.msg.sender_chat?.title ?? [ctx.from.first_name, ctx.from.last_name].filter(Boolean).join(" ");
     await sendMedia(media.items, {
@@ -233,7 +240,7 @@ bot.on("message:text", (ctx, next) => {
   const inVideoTopic = VIDEO_THREAD_ID && String(ctx.chat.id) === CHAT_ID && ctx.msg.message_thread_id === Number(VIDEO_THREAD_ID);
   const link = inVideoTopic && !ctx.msg.text.startsWith("/") && findMediaLink(ctx.msg.text, ctx.msg.entities);
   if (!link) return next();
-  videoQueue = videoQueue.then(() => swapForMedia(ctx, link));
+  enqueue(() => swapForMedia(ctx, link));
 });
 
 const lastRun = new Map();
