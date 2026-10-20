@@ -10,8 +10,9 @@ import { screenshot } from "./lib/screenshot.mjs";
 import { deadlinesCalendar } from "./lib/ical.mjs";
 import { subscribePage } from "./lib/page.mjs";
 import { dayKey, diffSchedule, formatChanges, formatDay, localTime, parseSchedule } from "./lib/schedule.mjs";
+import { downloadVideo, findVideoLink, formatCaption, updateYtDlp } from "./lib/video.mjs";
 
-const { BOT_TOKEN, CHAT_ID, OWNER_ID, THREAD_ID, SCHEDULE_ICS_URL, SCHEDULE_THREAD_ID } = process.env;
+const { BOT_TOKEN, CHAT_ID, OWNER_ID, THREAD_ID, SCHEDULE_ICS_URL, SCHEDULE_THREAD_ID, VIDEO_THREAD_ID } = process.env;
 if (!BOT_TOKEN) throw new Error("BOT_TOKEN is not set in .env");
 
 const REMIND_HOURS = (process.env.REMIND_HOURS || "72,24,3").split(",").map(Number);
@@ -36,12 +37,13 @@ const bot = new Bot(BOT_TOKEN);
 
 // In the forum group every outgoing message goes to the deadlines topic, even
 // a reply to a command typed in another topic: ctx.reply would otherwise answer
-// in whatever topic the command came from. Only the schedule posts, addressed
-// to their own topic explicitly, go elsewhere.
+// in whatever topic the command came from. Only the schedule and video posts,
+// addressed to their own topics explicitly, go elsewhere.
+const OWN_TOPICS = [SCHEDULE_THREAD_ID, VIDEO_THREAD_ID].filter(Boolean).map(Number);
 if (CHAT_ID && THREAD_ID) {
   bot.api.config.use((prev, method, payload, signal) => {
-    const toSchedule = SCHEDULE_THREAD_ID && payload?.message_thread_id === Number(SCHEDULE_THREAD_ID);
-    if (method.startsWith("send") && String(payload?.chat_id) === CHAT_ID && !toSchedule) {
+    const toOwnTopic = OWN_TOPICS.includes(payload?.message_thread_id);
+    if (method.startsWith("send") && String(payload?.chat_id) === CHAT_ID && !toOwnTopic) {
       payload = { ...payload, message_thread_id: Number(THREAD_ID) };
       delete payload.reply_parameters;
     }
@@ -165,6 +167,55 @@ async function refreshSummary(tasks, now) {
 bot.on("message:pinned_message", async (ctx, next) => {
   if (String(ctx.chat.id) !== CHAT_ID || ctx.from?.id !== ctx.me.id) return next();
   await ctx.deleteMessage().catch((err) => console.error("delete pin notice failed:", err.description));
+});
+
+// Optional video topic (VIDEO_THREAD_ID, see README). A message there with a
+// link to a video site is swapped for the video itself: bots can't edit other
+// people's messages, so the bot reposts it with the author's name and deletes
+// the original. If the download fails, the message stays as it is.
+// Downloads run one at a time, so a burst of links can't fill the server.
+const COOKIES_FILE = `${DATA_DIR}/yt-dlp-cookies.txt`;
+let videoQueue = Promise.resolve();
+
+async function swapForVideo(ctx, link) {
+  const threadId = Number(VIDEO_THREAD_ID);
+  // "sending a video…" in the topic header; Telegram drops it after 5 seconds.
+  const status = () => bot.api.sendChatAction(CHAT_ID, "upload_video", { message_thread_id: threadId }).catch(() => {});
+  status();
+  const typing = setInterval(status, 4500);
+  let video;
+  try {
+    video = await downloadVideo(link.url, { cookies: COOKIES_FILE });
+    // Anonymous admins post as the group itself.
+    const name = ctx.msg.sender_chat?.title ?? [ctx.from.first_name, ctx.from.last_name].filter(Boolean).join(" ");
+    await bot.api.sendVideo(CHAT_ID, new InputFile(video.file), {
+      message_thread_id: threadId,
+      caption: formatCaption({ name, text: ctx.msg.text, link }),
+      parse_mode: "HTML",
+      width: video.width,
+      height: video.height,
+      duration: video.duration,
+      supports_streaming: true,
+      // Keeps a reply a reply after the original is gone.
+      ...(ctx.msg.reply_to_message && !ctx.msg.reply_to_message.forum_topic_created && {
+        reply_parameters: { message_id: ctx.msg.reply_to_message.message_id, allow_sending_without_reply: true },
+      }),
+    });
+    await ctx.deleteMessage().catch((err) => console.error("delete link failed:", err.description));
+    console.log(new Date().toISOString(), `video from ${ctx.from.id}: ${link.url}`);
+  } catch (err) {
+    console.error(new Date().toISOString(), `video ${link.url}:`, err.description ?? err.message);
+  } finally {
+    clearInterval(typing);
+    video?.cleanup();
+  }
+}
+
+bot.on("message:text", (ctx, next) => {
+  const inVideoTopic = VIDEO_THREAD_ID && String(ctx.chat.id) === CHAT_ID && ctx.msg.message_thread_id === Number(VIDEO_THREAD_ID);
+  const link = inVideoTopic && !ctx.msg.text.startsWith("/") && findVideoLink(ctx.msg.text, ctx.msg.entities);
+  if (!link) return next();
+  videoQueue = videoQueue.then(() => swapForVideo(ctx, link));
 });
 
 const lastRun = new Map();
@@ -438,4 +489,8 @@ if (PUBLIC_URL) serve();
 loop();
 if (CONTEST_URL && CHAT_ID) contestLoop();
 if (SCHEDULE_ICS_URL && CHAT_ID) scheduleLoop();
+if (VIDEO_THREAD_ID && CHAT_ID) {
+  updateYtDlp();
+  setInterval(updateYtDlp, 86_400_000);
+}
 bot.start({ onStart: (me) => console.log(`@${me.username} started`) });
