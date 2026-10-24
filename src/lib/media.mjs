@@ -47,15 +47,17 @@ export function findMediaLink(text = "", entities = []) {
   return null;
 }
 
-// The repost stands in for the deleted message: who sent it, what they wrote
-// besides the link, and the link itself.
+// The repost stands in for the deleted message: who sent it (in the group;
+// a private chat has only one sender), what they wrote besides the link, and
+// the link itself.
 export function formatCaption({ name, text, link }) {
   const comment = (link.raw ? text.replace(link.raw, "") : text).trim();
-  const lines = [`<b>${escape(name)}</b>${comment ? `: ${escape(comment)}` : ""}`, `<a href="${escape(link.url)}">Источник</a>`];
-  const caption = lines.join("\n");
+  const head = (c) => [name && `<b>${escape(name)}</b>`, c && escape(c)].filter(Boolean).join(": ");
+  const source = `<a href="${escape(link.url)}">Источник</a>`;
+  const caption = [head(comment), source].filter(Boolean).join("\n");
   // Captions are capped at 1024 characters; cut the comment, keep the link.
   if (caption.length <= 1024) return caption;
-  return [`<b>${escape(name)}</b>: ${escape(comment.slice(0, 900))}…`, lines[1]].join("\n");
+  return [head(`${comment.slice(0, 900)}…`), source].join("\n");
 }
 
 function run(cmd, args, timeoutMs) {

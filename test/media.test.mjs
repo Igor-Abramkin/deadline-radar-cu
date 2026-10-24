@@ -34,6 +34,15 @@ test("caption keeps the author, the comment and the source", () => {
   assert.equal(formatCaption({ name: "Аня", text: `${raw}  лол`, link }), `<b>Аня</b>: лол\n<a href="${raw}">Источник</a>`);
 });
 
+test("in a private chat the caption has no author", () => {
+  const raw = "https://x.com/a/status/1";
+  const link = { url: raw, raw };
+  assert.equal(formatCaption({ name: null, text: raw, link }), `<a href="${raw}">Источник</a>`);
+  assert.equal(formatCaption({ name: null, text: `лол ${raw}`, link }), `лол\n<a href="${raw}">Источник</a>`);
+  const long = formatCaption({ name: null, text: `${raw} ${"а".repeat(2000)}`, link });
+  assert.ok(long.length <= 1024 && long.startsWith("ааа"));
+});
+
 test("long comments are cut to fit a caption", () => {
   const raw = "https://youtu.be/a";
   const caption = formatCaption({ name: "Аня", text: `${raw} ${"а".repeat(2000)}`, link: { url: raw, raw } });

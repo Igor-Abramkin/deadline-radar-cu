@@ -180,6 +180,9 @@ bot.on("message:pinned_message", async (ctx, next) => {
 // and deletes the original. If the download fails, the message stays as it is.
 // Two downloads run at a time, so a burst of links can't fill the server, and
 // videos longer than VIDEO_MAX_MINUTES are skipped so they don't hold up the rest.
+// The same works in a private chat with the bot, for members of the group only,
+// so strangers can't download through the proxy; there a failed download gets
+// a reply saying why.
 const COOKIES_FILE = `${DATA_DIR}/yt-dlp-cookies.txt`;
 // From a server in Russia most video sites are blocked; only the downloads
 // go through this proxy, the rest of the bot doesn't.
@@ -187,14 +190,14 @@ const VIDEO_PROXY = process.env.VIDEO_PROXY || undefined;
 const VIDEO_MAX_MINUTES = Number(process.env.VIDEO_MAX_MINUTES || 5);
 const enqueue = queue(2);
 
-function sendMedia(items, extra) {
+function sendMedia(chatId, items, extra) {
   const { caption, parse_mode, ...rest } = extra;
   if (items.length === 1 && items[0].type === "photo") {
-    return bot.api.sendPhoto(CHAT_ID, new InputFile(items[0].file), extra);
+    return bot.api.sendPhoto(chatId, new InputFile(items[0].file), extra);
   }
   if (items.length === 1) {
     const { file, width, height, duration } = items[0];
-    return bot.api.sendVideo(CHAT_ID, new InputFile(file), { ...extra, width, height, duration, supports_streaming: true });
+    return bot.api.sendVideo(chatId, new InputFile(file), { ...extra, width, height, duration, supports_streaming: true });
   }
   // An album carries one caption, on its first item.
   const album = items.map(({ type, file, width, height, duration }, i) => ({
@@ -203,22 +206,24 @@ function sendMedia(items, extra) {
     ...(i === 0 && { caption, parse_mode }),
     ...(type === "video" && { width, height, duration, supports_streaming: true }),
   }));
-  return bot.api.sendMediaGroup(CHAT_ID, album, rest);
+  return bot.api.sendMediaGroup(chatId, album, rest);
 }
 
 async function swapForMedia(ctx, link) {
-  const threadId = Number(VIDEO_THREAD_ID);
-  // "sending a video…" in the topic header; Telegram drops it after 5 seconds.
-  const status = () => bot.api.sendChatAction(CHAT_ID, "upload_video", { message_thread_id: threadId }).catch(() => {});
+  const isPrivate = ctx.chat.type === "private";
+  const chatId = ctx.chat.id;
+  const thread = isPrivate ? {} : { message_thread_id: Number(VIDEO_THREAD_ID) };
+  // "sending a video…" in the chat header; Telegram drops it after 5 seconds.
+  const status = () => bot.api.sendChatAction(chatId, "upload_video", thread).catch(() => {});
   status();
   const typing = setInterval(status, 4500);
   let media;
   try {
     media = await downloadMedia(link.url, { cookies: COOKIES_FILE, proxy: VIDEO_PROXY, maxDurationSec: VIDEO_MAX_MINUTES * 60 });
     // Anonymous admins post as the group itself.
-    const name = ctx.msg.sender_chat?.title ?? [ctx.from.first_name, ctx.from.last_name].filter(Boolean).join(" ");
-    await sendMedia(media.items, {
-      message_thread_id: threadId,
+    const name = isPrivate ? null : ctx.msg.sender_chat?.title ?? [ctx.from.first_name, ctx.from.last_name].filter(Boolean).join(" ");
+    await sendMedia(chatId, media.items, {
+      ...thread,
       caption: formatCaption({ name, text: ctx.msg.text, link }),
       parse_mode: "HTML",
       // Keeps a reply a reply after the original is gone.
@@ -227,19 +232,30 @@ async function swapForMedia(ctx, link) {
       }),
     });
     await ctx.deleteMessage().catch((err) => console.error("delete link failed:", err.description));
-    console.log(new Date().toISOString(), `media from ${ctx.from.id}: ${media.items.map((i) => i.type).join(",")} ${link.url}`);
+    console.log(new Date().toISOString(), `media from ${ctx.from.id} in ${chatId}: ${media.items.map((i) => i.type).join(",")} ${link.url}`);
   } catch (err) {
-    console.error(new Date().toISOString(), `media ${link.url}:`, err.description ?? err.message);
+    const reason = err.description ?? err.message;
+    console.error(new Date().toISOString(), `media ${link.url}:`, reason);
+    if (isPrivate) await ctx.reply(`Не получилось скачать: ${reason}`, { reply_parameters: { message_id: ctx.msg.message_id } }).catch(() => {});
   } finally {
     clearInterval(typing);
     media?.cleanup();
   }
 }
 
-bot.on("message:text", (ctx, next) => {
-  const inVideoTopic = VIDEO_THREAD_ID && String(ctx.chat.id) === CHAT_ID && ctx.msg.message_thread_id === Number(VIDEO_THREAD_ID);
-  const link = inVideoTopic && !ctx.msg.text.startsWith("/") && findMediaLink(ctx.msg.text, ctx.msg.entities);
-  if (!link) return next();
+const MEMBER = new Set(["creator", "administrator", "member"]);
+async function isGroupMember(userId) {
+  if (String(userId) === OWNER_ID) return true;
+  const member = await bot.api.getChatMember(CHAT_ID, userId).catch(() => null);
+  return MEMBER.has(member?.status) || (member?.status === "restricted" && member.is_member);
+}
+
+bot.on("message:text", async (ctx, next) => {
+  if (!VIDEO_THREAD_ID || !CHAT_ID || ctx.msg.text.startsWith("/")) return next();
+  const inVideoTopic = String(ctx.chat.id) === CHAT_ID && ctx.msg.message_thread_id === Number(VIDEO_THREAD_ID);
+  const inPrivate = ctx.chat.type === "private";
+  const link = (inVideoTopic || inPrivate) && findMediaLink(ctx.msg.text, ctx.msg.entities);
+  if (!link || (inPrivate && !(await isGroupMember(ctx.from.id)))) return next();
   enqueue(() => swapForMedia(ctx, link));
 });
 
