@@ -47,6 +47,15 @@ export function findMediaLink(text = "", entities = []) {
   return null;
 }
 
+// The same for plain text without entities, such as an inline query.
+export function findMediaUrl(text = "") {
+  for (const raw of text.match(/\S+/g) ?? []) {
+    const url = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
+    if (isMediaHost(url)) return { url, raw };
+  }
+  return null;
+}
+
 // The repost stands in for the deleted message: who sent it (in the group;
 // a private chat has only one sender), what they wrote besides the link, and
 // the link itself.

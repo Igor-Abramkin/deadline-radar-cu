@@ -1,17 +1,19 @@
 import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { Bot, InputFile } from "grammy";
 import { autoRetry } from "@grammyjs/auto-retry";
 import { SessionExpiredError, getMe, getTasks, setCookie } from "./lib/lms.mjs";
 import { loadState, saveState } from "./lib/store.mjs";
 import { diff } from "./lib/diff.mjs";
 import { guardCommand } from "./lib/guard.mjs";
-import { escape, formatDate, formatList, formatTask, formatTime } from "./lib/format.mjs";
+import { escape, formatDate, formatLeft, formatList, formatTask, formatTime } from "./lib/format.mjs";
 import { contestEvent, formatReminder, formatResult, winners } from "./lib/contest.mjs";
 import { screenshot } from "./lib/screenshot.mjs";
 import { deadlinesCalendar } from "./lib/ical.mjs";
 import { subscribePage } from "./lib/page.mjs";
 import { dayKey, diffSchedule, formatChanges, formatDay, localTime, parseSchedule } from "./lib/schedule.mjs";
-import { downloadMedia, findMediaLink, formatCaption, updateYtDlp } from "./lib/media.mjs";
+import { downloadMedia, findMediaLink, findMediaUrl, formatCaption, updateYtDlp } from "./lib/media.mjs";
+import { cachedResult, failedCaption, inlineCaption, inputMedia, pendingCaption, storedItem } from "./lib/inline.mjs";
 import { queue } from "./lib/queue.mjs";
 
 const { BOT_TOKEN, CHAT_ID, OWNER_ID, THREAD_ID, SCHEDULE_ICS_URL, SCHEDULE_THREAD_ID, VIDEO_THREAD_ID } = process.env;
@@ -87,6 +89,9 @@ function reminderTitle(hours) {
   return `🔥 Дедлайн через ${hours} ч`;
 }
 
+// The last poll's tasks, for inline answers, which can't wait for the LMS.
+let latestTasks = null;
+
 async function tick() {
   const state = loadState();
   let all;
@@ -106,6 +111,7 @@ async function tick() {
   state.sessionAlerted = false;
   if (PUBLIC_URL) writeAtomic(FEED_FILE, deadlinesCalendar(all));
   const tasks = upcoming(all);
+  latestTasks = all;
   // Without a target chat, only keep the LMS session warm: bootstrapping now
   // would mark reminders as sent that nobody ever saw.
   if (!CHAT_ID) return saveState(state);
@@ -259,6 +265,161 @@ bot.on("message:text", async (ctx, next) => {
   enqueue(() => swapForMedia(ctx, link));
 });
 
+// Inline mode (turned on in @BotFather, see README): "@bot <link>" in any
+// chat sends the video or photo there, "@bot" alone the deadlines summary.
+// Only for members of the group, like the private chat.
+//
+// An inline answer can't carry a file, only one already on Telegram's servers,
+// and has to come within seconds, while a download takes longer. So the bot
+// answers with a placeholder photo. Once the user sends it, Telegram reports
+// the message (chosen_inline_result, needs inline feedback on in @BotFather),
+// and the bot downloads the link, uploads the file to the owner's private chat
+// to get a file_id, deletes it there, and swaps the placeholder for it. A link
+// sent before is answered with the file straight away.
+const INLINE_MEDIA = Boolean(VIDEO_THREAD_ID && CHAT_ID && OWNER_ID);
+const PLACEHOLDER_FILE = fileURLToPath(new URL("./assets/loading.jpg", import.meta.url));
+const STORED_MAX = 300;
+const stored = new Map(); // url → item on Telegram's servers
+const storing = new Map(); // url → promise of it, so a link sent twice downloads once
+
+// Uploads to the owner's chat and deletes it there: the file_id stays valid.
+async function store(item, count) {
+  const extra = { disable_notification: true };
+  const msg =
+    item.type === "photo"
+      ? await bot.api.sendPhoto(OWNER_ID, new InputFile(item.file), extra)
+      : await bot.api.sendVideo(OWNER_ID, new InputFile(item.file), {
+          ...extra,
+          width: item.width,
+          height: item.height,
+          duration: item.duration,
+          supports_streaming: true,
+        });
+  bot.api.deleteMessage(OWNER_ID, msg.message_id).catch(() => {});
+  return storedItem(msg, item, count);
+}
+
+let placeholder = null;
+const placeholderId = () =>
+  (placeholder ??= store({ type: "photo", file: PLACEHOLDER_FILE }).then(
+    (item) => item.fileId,
+    (err) => {
+      placeholder = null;
+      throw err;
+    },
+  ));
+
+function storeLink(url) {
+  if (stored.has(url)) return Promise.resolve(stored.get(url));
+  if (storing.has(url)) return storing.get(url);
+  const job = async () => {
+    const media = await downloadMedia(url, { cookies: COOKIES_FILE, proxy: VIDEO_PROXY, maxDurationSec: VIDEO_MAX_MINUTES * 60 });
+    try {
+      return await store(media.items[0], media.items.length);
+    } finally {
+      media.cleanup();
+    }
+  };
+  // Shares the download queue with the video topic and the private chat.
+  const promise = new Promise((resolve, reject) => enqueue(() => job().then(resolve, reject)))
+    .then((item) => {
+      if (stored.size >= STORED_MAX) stored.delete(stored.keys().next().value);
+      stored.set(url, item);
+      return item;
+    })
+    .finally(() => storing.delete(url));
+  storing.set(url, promise);
+  return promise;
+}
+
+// Every keystroke is a new inline query, so membership is looked up once
+// in a while, not each time.
+const memberChecks = new Map(); // userId → { ok, at }
+async function isMemberCached(userId) {
+  const hit = memberChecks.get(userId);
+  if (hit && Date.now() - hit.at < 10 * 60_000) return hit.ok;
+  const ok = await isGroupMember(userId);
+  if (memberChecks.size > 1000) memberChecks.clear();
+  memberChecks.set(userId, { ok, at: Date.now() });
+  return ok;
+}
+
+async function deadlinesResult() {
+  latestTasks ??= await fetchAllTasks();
+  const now = Date.now();
+  const tasks = upcoming(latestTasks, now);
+  const next = tasks
+    .filter((t) => Date.parse(t.deadline) <= now + LIST_DAYS * 86_400_000)
+    .toSorted((a, b) => Date.parse(a.deadline) - Date.parse(b.deadline))[0];
+  return {
+    type: "article",
+    id: "deadlines",
+    title: `Дедлайны на ${LIST_DAYS} дней`,
+    description: next ? `Ближайший: ${next.name}, ${formatLeft(next.deadline, now)}` : "Дедлайнов нет 🎉",
+    input_message_content: { message_text: renderList(tasks, now), parse_mode: "HTML", link_preview_options: { is_disabled: true } },
+  };
+}
+
+bot.on("inline_query", async (ctx) => {
+  const { query, from } = ctx.inlineQuery;
+  // Answers differ by person (members only), so Telegram mustn't share them.
+  const personal = { is_personal: true, cache_time: 10 };
+  if (!(await isMemberCached(from.id))) {
+    return ctx
+      .answerInlineQuery([], { ...personal, cache_time: 60, button: { text: "Только для участников группы", start_parameter: "inline" } })
+      .catch((err) => console.error("inline answer failed:", err.description ?? err.message));
+  }
+  const link = INLINE_MEDIA && findMediaUrl(query);
+  let results = [];
+  try {
+    if (link) {
+      const item = stored.get(link.url);
+      const caption = inlineCaption(query, link, item?.count);
+      results = [
+        item
+          ? cachedResult("stored", item, caption)
+          : {
+              type: "photo",
+              id: "download",
+              photo_file_id: await placeholderId(),
+              title: "Отправить видео или фото",
+              caption: pendingCaption(caption),
+              parse_mode: "HTML",
+              // Without a keyboard Telegram doesn't say which message to edit.
+              reply_markup: { inline_keyboard: [[{ text: "Открыть источник", url: link.url }]] },
+            },
+      ];
+    } else {
+      results = [await deadlinesResult()];
+    }
+  } catch (err) {
+    console.error(new Date().toISOString(), "inline query:", err.description ?? err.message);
+  }
+  await ctx.answerInlineQuery(results, personal).catch((err) => console.error("inline answer failed:", err.description ?? err.message));
+});
+
+async function fillPlaceholder({ query, inline_message_id: id, from }) {
+  const link = findMediaUrl(query);
+  try {
+    const item = await storeLink(link.url);
+    await bot.api.editMessageMediaInline(id, inputMedia(item, inlineCaption(query, link, item.count)));
+    console.log(new Date().toISOString(), `inline media from ${from.id}: ${item.type} ${link.url}`);
+  } catch (err) {
+    const reason = String(err.description ?? err.message).slice(0, 200);
+    console.error(new Date().toISOString(), `inline media ${link.url}:`, reason);
+    await bot.api
+      .editMessageCaptionInline(id, { caption: failedCaption(inlineCaption(query, link), reason), parse_mode: "HTML" })
+      .catch(() => {});
+  }
+}
+
+// Not awaited: updates are handled one at a time, and a download would hold
+// up every one behind it.
+bot.chosenInlineResult("download", (ctx) => {
+  const result = ctx.chosenInlineResult;
+  if (INLINE_MEDIA && result.inline_message_id && findMediaUrl(result.query)) fillPlaceholder(result);
+});
+
 const lastRun = new Map();
 bot.on("message:text", async (ctx, next) => {
   const verdict = guardCommand(
@@ -299,6 +460,8 @@ bot.command(["start", "help"], (ctx) =>
         ? ["", `В теме расписания каждый день в ${SCHEDULE_TIME} пишу, какие сегодня пары, и сообщаю, если пару перенесли или отменили.`]
         : []),
       ...(PUBLIC_URL ? ["", `Дедлайны в своём календаре: ${PUBLIC_URL}`] : []),
+      "",
+      `В любом чате: @${ctx.me.username} — сводка дедлайнов${INLINE_MEDIA ? `, @${ctx.me.username} ссылка — видео или фото по ней` : ""}. Только для участников группы.`,
     ].join("\n"),
     { link_preview_options: { is_disabled: true } },
   ),

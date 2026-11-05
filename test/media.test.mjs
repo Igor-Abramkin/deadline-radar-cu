@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { findMediaLink, formatCaption, instagramSources, mediaItems } from "../src/lib/media.mjs";
+import { findMediaLink, findMediaUrl, formatCaption, instagramSources, mediaItems } from "../src/lib/media.mjs";
 
 const url = (text, raw) => ({ type: "url", offset: text.indexOf(raw), length: raw.length });
 
@@ -88,4 +88,11 @@ test("album keeps photos and videos in order, drops the rest, caps at 10", () =>
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("finds a link in plain text, such as an inline query", () => {
+  assert.deepEqual(findMediaUrl("https://youtu.be/xyz лол"), { url: "https://youtu.be/xyz", raw: "https://youtu.be/xyz" });
+  assert.deepEqual(findMediaUrl("вот vm.tiktok.com/Z1/"), { url: "https://vm.tiktok.com/Z1/", raw: "vm.tiktok.com/Z1/" });
+  assert.equal(findMediaUrl("https://example.com/a дедлайны"), null);
+  assert.equal(findMediaUrl(""), null);
 });
