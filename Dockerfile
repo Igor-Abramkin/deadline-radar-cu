@@ -4,6 +4,11 @@ ARG TARGETARCH
 WORKDIR /app
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 COPY package.json bun.lock ./
+# Where a server reaches deb.debian.org slowly, name a closer mirror:
+# `--build-arg APT_MIRROR=http://mirror.yandex.ru`. Playwright installs
+# Chromium's libraries through apt as well, so this covers most of the build.
+ARG APT_MIRROR
+RUN if [ -n "$APT_MIRROR" ]; then sed -i "s|http://deb.debian.org|$APT_MIRROR|g" /etc/apt/sources.list.d/debian.sources; fi
 # ffmpeg and the standalone yt-dlp and gallery-dl binaries download videos and
 # photos for the video topic; the bot updates yt-dlp itself once a day,
 # gallery-dl (its nightly build, x86-64 only) updates with each image build.
