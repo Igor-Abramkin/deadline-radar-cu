@@ -1,4 +1,4 @@
-const OWN_COMMANDS = new Set(["start", "help", "deadlines", "chatid", "session"]);
+const OWN_COMMANDS = new Set(["start", "help", "deadlines", "summary", "chatid", "session"]);
 
 // Decides what to do with an incoming command: `remove` deletes the message,
 // `run` lets the handler answer. Mutates `lastRun` (key → timestamp).
@@ -7,7 +7,9 @@ const OWN_COMMANDS = new Set(["start", "help", "deadlines", "chatid", "session"]
 // so people type commands elsewhere and the answer goes to the topic), repeats
 // within the cooldown are ignored, and /session never runs there because it
 // carries the LMS cookie. The owner has no cooldown and doesn't use up anyone
-// else's; /chatid and /session are owner-only.
+// else's; /chatid and /session are owner-only. /summary always runs: it answers
+// each person in private, and its handler keeps a limit of its own, counted
+// only when a summary is really written.
 export function guardCommand(msg, lastRun, cfg) {
   const m = msg.text?.match(/^\/([a-z_]+)(?:@(\w+))?(?:\s|$)/i);
   if (!m) return null;
@@ -17,6 +19,7 @@ export function guardCommand(msg, lastRun, cfg) {
 
   const inGroup = String(msg.chatId) === cfg.chatId;
   if (!inGroup && msg.chatType !== "private") return { command, remove: false, run: true };
+  if (command === "summary") return { command, remove: inGroup, run: true };
   const isOwner = String(msg.userId) === cfg.ownerId;
   if (command === "session") return { command, remove: inGroup, run: !inGroup && isOwner };
   if (command === "chatid" && !isOwner) return { command, remove: inGroup, run: false };

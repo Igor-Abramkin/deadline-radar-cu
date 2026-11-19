@@ -39,6 +39,14 @@ test("session is removed in the group, even in the topic, and never runs there",
   assert.deepEqual(guardCommand(dm("/session abc", 1), new Map(), cfg), { command: "session", remove: false, run: false });
 });
 
+test("summary always runs, for everyone: it keeps its own limit", () => {
+  const last = new Map();
+  for (let i = 0; i < 3; i++) {
+    assert.deepEqual(guardCommand({ ...group("/summary 24h", 7, i), userId: i }, last, cfg), { command: "summary", remove: true, run: true });
+    assert.deepEqual(guardCommand(dm("/summary", 1, i), last, cfg), { command: "summary", remove: false, run: true });
+  }
+});
+
 test("other bots' commands and plain text are ignored", () => {
   assert.equal(guardCommand(group("/deadlines@other_bot", 7), new Map(), cfg), null);
   assert.equal(guardCommand(group("/poll", 7), new Map(), cfg), null);
