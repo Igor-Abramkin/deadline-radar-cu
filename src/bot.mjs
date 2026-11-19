@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { Bot, InputFile } from "grammy";
+import { Api, Bot, GrammyError, InputFile } from "grammy";
 import { autoRetry } from "@grammyjs/auto-retry";
 import { SessionExpiredError, getMe, getTasks, setCookie } from "./lib/lms.mjs";
 import { loadState, saveState } from "./lib/store.mjs";
@@ -15,6 +15,8 @@ import { dayKey, diffSchedule, formatChanges, formatDay, localTime, parseSchedul
 import { downloadMedia, findMediaLink, findMediaUrl, formatCaption, updateYtDlp } from "./lib/media.mjs";
 import { cachedResult, failedCaption, inlineCaption, inputMedia, pendingCaption, storedItem } from "./lib/inline.mjs";
 import { queue } from "./lib/queue.mjs";
+import { openLog, toEntry, topicOf } from "./lib/chatlog.mjs";
+import { buildTranscript, countMessages, parseWindow, renderSummary, splitMessage, summarize, windowLabel, windowSpec } from "./lib/summary.mjs";
 
 const { BOT_TOKEN, CHAT_ID, OWNER_ID, THREAD_ID, SCHEDULE_ICS_URL, SCHEDULE_THREAD_ID, VIDEO_THREAD_ID } = process.env;
 if (!BOT_TOKEN) throw new Error("BOT_TOKEN is not set in .env");
@@ -36,6 +38,9 @@ const SCHEDULE_POLL_MINUTES = Number(process.env.SCHEDULE_POLL_MINUTES || 15);
 const SCHEDULE_ORGANIZER = process.env.SCHEDULE_ORGANIZER ?? "timetable@centraluniversity.ru";
 const SCHEDULE_EXCLUDE = process.env.SCHEDULE_EXCLUDE ? new RegExp(process.env.SCHEDULE_EXCLUDE, "i") : null;
 const SCHEDULE_SIGNUP = process.env.SCHEDULE_SIGNUP ? new RegExp(process.env.SCHEDULE_SIGNUP, "i") : null;
+const SUMMARY = Boolean(process.env.OPENROUTER_API_KEY && CHAT_ID);
+const SUMMARY_MODEL = process.env.SUMMARY_MODEL || "anthropic/claude-haiku-5.5";
+const SUMMARY_COOLDOWN_SEC = Number(process.env.SUMMARY_COOLDOWN_SEC || 10_800);
 
 const bot = new Bot(BOT_TOKEN);
 // On "Too Many Requests" (a burst of albums hits the group limit) Telegram
@@ -60,6 +65,45 @@ if (CHAT_ID && THREAD_ID) {
 
 const send = (chatId, text) =>
   bot.api.sendMessage(chatId, text, { parse_mode: "HTML", link_preview_options: { is_disabled: true } });
+
+// Optional chat summaries (OPENROUTER_API_KEY, see README): `/summary` tells a
+// member what they missed, written by a model from what people wrote in the
+// group. A bot can't read a chat's history, so every message of the group is
+// written down as it arrives and dropped after SUMMARY_DAYS. Registered before
+// the other handlers, which don't all pass a message on.
+//
+// The bot's own topics are left out: the deadlines and schedule topics hold
+// only its posts, and the video topic holds videos, which a summary can't see.
+// SUMMARY_EXCLUDE_THREADS adds more.
+const chatLog = SUMMARY ? openLog(`${DATA_DIR}/messages.sqlite`) : null;
+const UNLOGGED_TOPICS = new Set(
+  [THREAD_ID, SCHEDULE_THREAD_ID, VIDEO_THREAD_ID, ...(process.env.SUMMARY_EXCLUDE_THREADS || "").split(",")]
+    .map((id) => id?.trim())
+    .filter(Boolean)
+    .map(Number),
+);
+
+function logMessage(msg, edited) {
+  const topic = topicOf(msg);
+  if (topic) chatLog.setTopic(topic);
+  const entry = toEntry(msg);
+  if (!entry) return;
+  if (!edited && msg.from) chatLog.touch(msg.from.id, entry.date);
+  if (!UNLOGGED_TOPICS.has(entry.threadId)) chatLog.add(entry);
+}
+
+if (SUMMARY) {
+  bot.on(["message", "edited_message"], (ctx, next) => {
+    if (String(ctx.chat.id) === CHAT_ID) {
+      try {
+        logMessage(ctx.msg, Boolean(ctx.editedMessage));
+      } catch (err) {
+        console.error(new Date().toISOString(), "chat log:", err.message);
+      }
+    }
+    return next();
+  });
+}
 
 async function fetchAllTasks() {
   const tasks = await getTasks();
@@ -447,6 +491,147 @@ bot.on("message:text", async (ctx, next) => {
   if (verdict.run) return next();
 });
 
+// `/summary` tells one member what they missed, so it answers in private,
+// wherever it was typed. With no argument it covers the time since the
+// member's last message in the group, the nearest a bot gets to "unread": only
+// their own app knows what they have read. `/summary 3d` covers days,
+// `/summary 200` the last messages.
+const SUMMARY_DAYS = 7;
+const SUMMARY_MAX_MESSAGES = 1000;
+// Fewer new messages than this are quicker to read than to summarize.
+const SUMMARY_MIN_MESSAGES = 10;
+const HTML_TEXT = { parse_mode: "HTML", link_preview_options: { is_disabled: true } };
+const summaryLimits = { maxDays: SUMMARY_DAYS, minMessages: SUMMARY_MIN_MESSAGES, maxMessages: SUMMARY_MAX_MESSAGES };
+const summaryJobs = queue(2);
+// Every summary is a paid request, so a member gets one per SUMMARY_COOLDOWN_SEC.
+const lastSummary = new Map(); // userId → when their last summary was started
+
+// The transformer above would move a message for the group into the deadlines
+// topic; this one sends where it is told.
+const direct = new Api(BOT_TOKEN);
+direct.config.use(autoRetry({ maxRetryAttempts: 5, maxDelaySeconds: 300 }));
+
+// "2 ч 15 мин", rounded up to the minute.
+function formatWait(ms) {
+  const minutes = Math.ceil(ms / 60_000);
+  return [minutes >= 60 && `${Math.floor(minutes / 60)} ч`, minutes % 60 && `${minutes % 60} мин`].filter(Boolean).join(" ");
+}
+
+async function writeSummary(period, found) {
+  const transcript = buildTranscript(found.messages, chatLog.topics(), {
+    period,
+    now: Date.now(),
+    general: process.env.SUMMARY_GENERAL_NAME || undefined,
+  });
+  const result = await summarize({
+    apiKey: process.env.OPENROUTER_API_KEY,
+    model: SUMMARY_MODEL,
+    transcript,
+    proxy: process.env.SUMMARY_PROXY || undefined,
+  });
+  return splitMessage(renderSummary(result, { heading: "Что было в чате", period, chatId: CHAT_ID, ...found }));
+}
+
+// Why a summary failed, for the log and the owner.
+function summaryFailure(err) {
+  if (err.status === 401 || err.status === 403) return "ключ OPENROUTER_API_KEY не подошёл";
+  if (err.status === 402) return "на счёте OpenRouter закончились деньги";
+  if (err.status === 429) return "упёрлись в лимит запросов к модели";
+  if (err.status) return `OpenRouter ответил ${err.status}: ${err.message}`;
+  return err.description ?? err.message;
+}
+
+// What to answer first: a refusal, or "reading…" together with the job that
+// writes the summary.
+function planSummary(user, window) {
+  if (!window) {
+    return {
+      text: `Формат: /summary, /summary 3d (от 1 до ${SUMMARY_DAYS} дней) или /summary 200 (от ${SUMMARY_MIN_MESSAGES} до ${SUMMARY_MAX_MESSAGES} последних сообщений).`,
+    };
+  }
+  const now = Date.now();
+  const seen = window.kind === "since" ? chatLog.lastSeen(user.id) : null;
+  // Someone who never wrote in the chat gets the last day; someone silent
+  // for longer than the log reaches, all of it.
+  if (window.kind === "since" && !seen) window = { kind: "days", days: 1 };
+  else if (window.kind === "since" && seen < now - SUMMARY_DAYS * DAY_MS) window = { kind: "days", days: SUMMARY_DAYS };
+  const period = windowLabel(window, seen);
+  const from = window.kind === "since" ? seen : window.kind === "days" ? now - window.days * DAY_MS : 0;
+  const found = chatLog.window({ from, limit: window.kind === "count" ? window.count : SUMMARY_MAX_MESSAGES });
+  // Asked for a number of messages, that number is all there is to tell.
+  if (window.kind === "count") found.total = found.messages.length;
+
+  if (found.messages.length < SUMMARY_MIN_MESSAGES) {
+    const scope = window.kind === "count" ? "В чате" : `${period[0].toUpperCase()}${period.slice(1)} в чате`;
+    const amount = found.messages.length ? `всего ${countMessages(found.messages.length)}` : "не было сообщений";
+    const hint = window.kind === "since" ? "\nЗа другое время: /summary 1d" : "";
+    return { text: `${escape(scope)} ${amount}, пересказывать нечего.${hint}` };
+  }
+  const wait = SUMMARY_COOLDOWN_SEC * 1000 - (now - (lastSummary.get(user.id) ?? -Infinity));
+  if (wait > 0 && String(user.id) !== OWNER_ID) {
+    return { text: `Пересказ можно просить раз в ${formatWait(SUMMARY_COOLDOWN_SEC * 1000)}, следующий будет доступен через ${formatWait(wait)}.` };
+  }
+  return { text: `⏳ Читаю ${countMessages(found.messages.length)}…`, run: () => writeSummary(period, found) };
+}
+
+// A bot can't write to someone first. The button opens the private chat, and
+// its Start sends `/start summary_…`, which runs the same request there.
+async function inviteToPrivate(ctx, window) {
+  const spec = window ? windowSpec(window) : "";
+  const msg = await direct.sendMessage(
+    CHAT_ID,
+    `<a href="tg://user?id=${ctx.from.id}">${escape(ctx.from.first_name)}</a>, пересказ пришлю в личку, но сначала открой меня там: первым я написать не могу.`,
+    {
+      ...HTML_TEXT,
+      ...(ctx.msg.is_topic_message && { message_thread_id: ctx.msg.message_thread_id }),
+      reply_markup: { inline_keyboard: [[{ text: "Открыть бота", url: `https://t.me/${ctx.me.username}?start=summary${spec && `_${spec}`}` }]] },
+    },
+  );
+  setTimeout(() => direct.deleteMessage(CHAT_ID, msg.message_id).catch(() => {}), 60_000);
+}
+
+async function requestSummary(ctx, arg) {
+  const inGroup = String(ctx.chat.id) === CHAT_ID;
+  if (!SUMMARY || (!inGroup && ctx.chat.type !== "private")) return;
+  const user = ctx.from;
+  const window = parseWindow(arg, summaryLimits);
+  // The summary quotes the group, so outside it only members get one.
+  const plan =
+    inGroup || (await isMemberCached(user.id)) ? planSummary(user, window) : { text: "Пересказ чата доступен только участникам группы." };
+  let notice;
+  try {
+    notice = await bot.api.sendMessage(user.id, plan.text, HTML_TEXT);
+  } catch (err) {
+    if (inGroup && err instanceof GrammyError && err.error_code === 403) return inviteToPrivate(ctx, window);
+    throw err;
+  }
+  if (!plan.run) return;
+  lastSummary.set(user.id, Date.now());
+  // Not awaited: the model takes a while, and updates are handled one at a time.
+  summaryJobs(async () => {
+    try {
+      for (const part of await plan.run()) await bot.api.sendMessage(user.id, part, HTML_TEXT);
+      await bot.api.deleteMessage(user.id, notice.message_id).catch(() => {});
+      console.log(new Date().toISOString(), `summary for ${user.id}: ${arg || "since last message"}`);
+    } catch (err) {
+      // A failed summary doesn't use up the member's limit.
+      lastSummary.delete(user.id);
+      const reason = summaryFailure(err);
+      console.error(new Date().toISOString(), `summary for ${user.id}:`, reason);
+      const detail = String(user.id) === OWNER_ID ? `\n${reason}` : "";
+      await bot.api.editMessageText(user.id, notice.message_id, `Не получилось пересказать чат, попробуй позже.${detail}`).catch(() => {});
+    }
+  });
+}
+
+bot.command("summary", (ctx) => requestSummary(ctx, ctx.match));
+
+// The "open the bot" button leads here.
+bot.command("start", (ctx, next) => {
+  const asked = ctx.chat.type === "private" && ctx.match.match(/^summary(?:_(\w+))?$/);
+  return SUMMARY && asked ? requestSummary(ctx, asked[1] ?? "") : next();
+});
+
 bot.command(["start", "help"], (ctx) =>
   ctx.reply(
     [
@@ -460,6 +645,12 @@ bot.command(["start", "help"], (ctx) =>
         ? ["", `В теме расписания каждый день в ${SCHEDULE_TIME} пишу, какие сегодня пары, и сообщаю, если пару перенесли или отменили.`]
         : []),
       ...(PUBLIC_URL ? ["", `Дедлайны в своём календаре: ${PUBLIC_URL}`] : []),
+      ...(SUMMARY
+        ? [
+            "",
+            `/summary — пересказ того, что было в чате с твоего последнего сообщения. /summary 3d — за дни (до ${SUMMARY_DAYS}), /summary 200 — последние сообщения (до ${SUMMARY_MAX_MESSAGES}). Отвечаю в личку, не чаще раза в ${formatWait(SUMMARY_COOLDOWN_SEC * 1000)}.`,
+          ]
+        : []),
       "",
       `В любом чате: @${ctx.me.username} — сводка дедлайнов${INLINE_MEDIA ? `, @${ctx.me.username} ссылка — видео или фото по ней` : ""}. Только для участников группы.`,
     ].join("\n"),
@@ -652,6 +843,11 @@ async function scheduleLoop() {
   setTimeout(scheduleLoop, 60_000);
 }
 
+function pruneChatLog() {
+  const dropped = chatLog.prune(Date.now() - SUMMARY_DAYS * DAY_MS);
+  if (dropped) console.log(new Date().toISOString(), `chat log: dropped ${dropped} old messages`);
+}
+
 // PUBLIC_URL turns on a tiny web server: the deadlines feed and a page with
 // subscribe links. The feed is the file the last LMS poll wrote.
 const FEED_FILE = `${DATA_DIR}/deadlines.ics`;
@@ -686,6 +882,7 @@ async function loop() {
 
 await bot.api.setMyCommands([
   { command: "deadlines", description: "Ближайшие дедлайны" },
+  ...(SUMMARY ? [{ command: "summary", description: "Что было в чате" }] : []),
   { command: "help", description: "Что умеет бот" },
 ]);
 if (!CHAT_ID) console.warn("CHAT_ID is not set: add the bot to the group, send /chatid, put the id in .env");
@@ -696,5 +893,9 @@ if (SCHEDULE_ICS_URL && CHAT_ID) scheduleLoop();
 if (VIDEO_THREAD_ID && CHAT_ID) {
   updateYtDlp();
   setInterval(updateYtDlp, 86_400_000);
+}
+if (SUMMARY) {
+  pruneChatLog();
+  setInterval(pruneChatLog, DAY_MS);
 }
 bot.start({ onStart: (me) => console.log(`@${me.username} started`) });
